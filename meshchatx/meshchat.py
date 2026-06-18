@@ -137,6 +137,7 @@ from meshchatx.src.backend.page_node_manager import PageNodeManager
 from meshchatx.src.backend.persistent_log_handler import PersistentLogHandler
 from meshchatx.src.backend.recovery import CrashRecovery, HealthMonitor
 from meshchatx.src.backend import reticulum_pathfinding
+from meshchatx.src.backend.rns_link_manager import RnsLinkManager
 from meshchatx.src.backend.rnprobe_handler import RNProbeHandler
 from meshchatx.src.backend.sideband_commands import SidebandCommands
 from meshchatx.src.backend.sticker_utils import (
@@ -385,6 +386,12 @@ class ReticulumMeshChat:
 
         self.setup_identity(identity)
         self.web_audio_bridge = WebAudioBridge(None, None)
+
+        self.rns_link_manager = RnsLinkManager(
+            self_identity_getter=lambda: self.identity,
+            reticulum_getter=lambda: getattr(self, "reticulum", None),
+            broadcast_event=self._broadcast_to_websocket_clients,
+        )
 
     # Proxy properties for backward compatibility
     @property
@@ -16052,9 +16059,239 @@ class ReticulumMeshChat:
                 ),
             )
 
+        # generic RNS Link API: open a link to (aspect, destination_hash)
+        elif _type == "rns.link.open":
+            await self._handle_rns_link_open(client, data)
+
+        # generic RNS Link API: identify on an existing link
+        elif _type == "rns.link.identify":
+            await self._handle_rns_link_identify(client, data)
+
+        # generic RNS Link API: request/response over an existing (or newly opened) link
+        elif _type == "rns.link.request":
+            await self._handle_rns_link_request(client, data)
+
+        # generic RNS Link API: send a raw packet on an existing link
+        elif _type == "rns.link.send":
+            await self._handle_rns_link_send(client, data)
+
+        # generic RNS Link API: close (teardown) a cached link
+        elif _type == "rns.link.close":
+            await self._handle_rns_link_close(client, data)
+
         # unhandled type
         else:
             print("unhandled client message type: " + _type)
+
+    # ---- generic RNS Link API handlers (rns.link.*) -------------------------
+
+    @staticmethod
+    def _rns_link_parse_dest_aspect(data):
+        dest_hex = data.get("destination_hash")
+        aspect = data.get("aspect")
+        if not dest_hex or not aspect:
+            return None, None, "missing_destination_or_aspect"
+        try:
+            return bytes.fromhex(dest_hex), aspect, None
+        except ValueError:
+            return None, None, "invalid_destination_hash"
+
+    @staticmethod
+    async def _rns_link_send(client, payload):
+        try:
+            await client.send_str(json.dumps(payload))
+        except Exception as e:
+            print(f"rns.link reply failed: {e}")
+
+    async def _handle_rns_link_open(self, client, data):
+        request_id = data.get("request_id")
+        dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
+        if err:
+            await self._rns_link_send(client, {
+                "type": "rns.link.open", "request_id": request_id,
+                "status": "failure", "failure_reason": err,
+            })
+            return
+        auto_identify = bool(data.get("auto_identify", False))
+
+        def on_phase(phase):
+            AsyncUtils.run_async(self._rns_link_send(client, {
+                "type": "rns.link.open", "request_id": request_id,
+                "status": "phase", "phase": phase,
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            }))
+
+        link, identified, failure_reason = await self.rns_link_manager.open_link(
+            dest_hash, aspect,
+            auto_identify=auto_identify,
+            on_phase=on_phase,
+        )
+        if link is None:
+            await self._rns_link_send(client, {
+                "type": "rns.link.open", "request_id": request_id,
+                "status": "failure", "failure_reason": failure_reason or "unknown",
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            })
+            return
+        await self._rns_link_send(client, {
+            "type": "rns.link.open", "request_id": request_id,
+            "status": "success", "identified": identified,
+            "destination_hash": dest_hash.hex(), "aspect": aspect,
+        })
+
+    async def _handle_rns_link_identify(self, client, data):
+        request_id = data.get("request_id")
+        dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
+        if err:
+            await self._rns_link_send(client, {
+                "type": "rns.link.identify", "request_id": request_id,
+                "status": "failure", "failure_reason": err,
+            })
+            return
+        ok, failure_reason = self.rns_link_manager.identify(dest_hash, aspect)
+        await self._rns_link_send(client, {
+            "type": "rns.link.identify", "request_id": request_id,
+            "status": "success" if ok else "failure",
+            "failure_reason": failure_reason,
+            "destination_hash": dest_hash.hex(), "aspect": aspect,
+        })
+
+    async def _handle_rns_link_request(self, client, data):
+        request_id = data.get("request_id")
+        dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
+        if err:
+            await self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": err,
+            })
+            return
+        path = data.get("path")
+        if not path:
+            await self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": "missing_path",
+            })
+            return
+        import base64
+        data_b64 = data.get("data_b64")
+        try:
+            body = base64.b64decode(data_b64) if data_b64 else None
+        except Exception:
+            await self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": "invalid_data_b64",
+            })
+            return
+        timeout = data.get("timeout")
+
+        # ensure the link is open (don't auto-identify; callers do that explicitly)
+        def on_phase(phase):
+            AsyncUtils.run_async(self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "phase", "phase": phase,
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            }))
+        link, _identified, failure_reason = await self.rns_link_manager.open_link(
+            dest_hash, aspect,
+            auto_identify=False,
+            on_phase=on_phase,
+        )
+        if link is None:
+            await self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": failure_reason or "unknown",
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            })
+            return
+
+        def on_response(request_receipt):
+            raw = request_receipt.response
+            if raw is None:
+                body_b64 = ""
+            elif isinstance(raw, (bytes, bytearray)):
+                body_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+            elif isinstance(raw, str):
+                body_b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+            else:
+                body_b64 = ""
+            AsyncUtils.run_async(self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "success", "body_b64": body_b64,
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            }))
+
+        def on_failed(_receipt=None):
+            AsyncUtils.run_async(self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": "request_failed",
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            }))
+
+        def on_progress(receipt):
+            AsyncUtils.run_async(self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "progress", "progress": receipt.progress,
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            }))
+
+        try:
+            self.rns_link_manager.request(
+                dest_hash, aspect, path, body,
+                response_callback=on_response,
+                failed_callback=on_failed,
+                progress_callback=on_progress,
+                timeout=timeout,
+            )
+        except Exception as e:
+            await self._rns_link_send(client, {
+                "type": "rns.link.request", "request_id": request_id,
+                "status": "failure", "failure_reason": f"request_dispatch_failed: {e}",
+                "destination_hash": dest_hash.hex(), "aspect": aspect,
+            })
+
+    async def _handle_rns_link_send(self, client, data):
+        request_id = data.get("request_id")
+        dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
+        if err:
+            await self._rns_link_send(client, {
+                "type": "rns.link.send", "request_id": request_id,
+                "status": "failure", "failure_reason": err,
+            })
+            return
+        import base64
+        payload_b64 = data.get("payload_b64", "")
+        try:
+            payload = base64.b64decode(payload_b64) if payload_b64 else b""
+        except Exception:
+            await self._rns_link_send(client, {
+                "type": "rns.link.send", "request_id": request_id,
+                "status": "failure", "failure_reason": "invalid_payload_b64",
+            })
+            return
+        ok, failure_reason = self.rns_link_manager.send_packet(dest_hash, aspect, payload)
+        await self._rns_link_send(client, {
+            "type": "rns.link.send", "request_id": request_id,
+            "status": "success" if ok else "failure",
+            "failure_reason": failure_reason,
+            "destination_hash": dest_hash.hex(), "aspect": aspect,
+        })
+
+    async def _handle_rns_link_close(self, client, data):
+        request_id = data.get("request_id")
+        dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
+        if err:
+            await self._rns_link_send(client, {
+                "type": "rns.link.close", "request_id": request_id,
+                "status": "failure", "failure_reason": err,
+            })
+            return
+        ok = self.rns_link_manager.close(dest_hash, aspect)
+        await self._rns_link_send(client, {
+            "type": "rns.link.close", "request_id": request_id,
+            "status": "success" if ok else "failure",
+            "failure_reason": None if ok else "no_active_link",
+            "destination_hash": dest_hash.hex(), "aspect": aspect,
+        })
 
     async def websocket_broadcast(self, data):
         # Serialize: concurrent callers must not interleave; the second snapshot must run
@@ -16105,6 +16342,13 @@ class ReticulumMeshChat:
                 },
             ),
         )
+
+    def _broadcast_to_websocket_clients(self, payload: dict) -> None:
+        """Thread-safe fire-and-forget broadcast (callable from RNS callback threads)."""
+        try:
+            AsyncUtils.run_async(self.websocket_broadcast(json.dumps(payload)))
+        except Exception as e:
+            print(f"_broadcast_to_websocket_clients: failed: {e}")
 
     async def _broadcast_blocked_destinations(self):
         try:
