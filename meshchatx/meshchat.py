@@ -393,6 +393,14 @@ class ReticulumMeshChat:
             broadcast_event=self._broadcast_to_websocket_clients,
         )
 
+        # Track long-running rns.link.* handler tasks per WS client so they can
+        # be cancelled when the client disconnects (page refresh, tab close,
+        # network drop). Without this, an in-flight rns.link.open keeps polling
+        # path discovery / link establishment after the originating client is
+        # gone, potentially caching an unwanted link and emitting spurious
+        # broadcast events.
+        self._rns_link_tasks: dict[web.WebSocketResponse, set[asyncio.Task]] = {}
+
     # Proxy properties for backward compatibility
     @property
     def identity(self):
@@ -5845,6 +5853,10 @@ class ReticulumMeshChat:
 
             # websocket closed
             self.websocket_clients.remove(websocket_response)
+            # Cancel any in-flight rns.link.* handler tasks owned by this
+            # client. Each task catches CancelledError to do partial cleanup
+            # (e.g. teardown a half-established link) before propagating.
+            self._cancel_rns_link_tasks_for_client(websocket_response)
 
             return websocket_response
 
@@ -16061,7 +16073,12 @@ class ReticulumMeshChat:
 
         # generic RNS Link API: open a link to (aspect, destination_hash)
         elif _type == "rns.link.open":
-            await self._handle_rns_link_open(client, data)
+            # Dispatch as a tracked task so the WS message loop can keep
+            # accepting other inbound messages while path discovery / link
+            # establishment polls — and so a client disconnect can cancel it.
+            self._track_rns_link_task(
+                client, asyncio.create_task(self._handle_rns_link_open(client, data)),
+            )
 
         # generic RNS Link API: identify on an existing link
         elif _type == "rns.link.identify":
@@ -16069,7 +16086,9 @@ class ReticulumMeshChat:
 
         # generic RNS Link API: request/response over an existing (or newly opened) link
         elif _type == "rns.link.request":
-            await self._handle_rns_link_request(client, data)
+            self._track_rns_link_task(
+                client, asyncio.create_task(self._handle_rns_link_request(client, data)),
+            )
 
         # generic RNS Link API: send a raw packet on an existing link
         elif _type == "rns.link.send":
@@ -16084,6 +16103,37 @@ class ReticulumMeshChat:
             print("unhandled client message type: " + _type)
 
     # ---- generic RNS Link API handlers (rns.link.*) -------------------------
+
+    def _track_rns_link_task(self, client, task: asyncio.Task) -> None:
+        """Register a long-running rns.link.* handler task against its WS client.
+
+        On task completion the entry self-removes via add_done_callback, so the
+        dict only ever holds genuinely in-flight tasks. On client disconnect
+        the WS handler calls _cancel_rns_link_tasks_for_client to cancel all
+        outstanding tasks for that client.
+        """
+        bucket = self._rns_link_tasks.get(client)
+        if bucket is None:
+            bucket = set()
+            self._rns_link_tasks[client] = bucket
+        bucket.add(task)
+        task.add_done_callback(lambda t, c=client: self._untrack_rns_link_task(c, t))
+
+    def _untrack_rns_link_task(self, client, task: asyncio.Task) -> None:
+        bucket = self._rns_link_tasks.get(client)
+        if not bucket:
+            return
+        bucket.discard(task)
+        if not bucket:
+            self._rns_link_tasks.pop(client, None)
+
+    def _cancel_rns_link_tasks_for_client(self, client) -> None:
+        bucket = self._rns_link_tasks.pop(client, None)
+        if not bucket:
+            return
+        for task in bucket:
+            if not task.done():
+                task.cancel()
 
     @staticmethod
     def _rns_link_parse_dest_aspect(data):

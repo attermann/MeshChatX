@@ -139,11 +139,15 @@ class RnsLinkManager:
         if not RNS.Transport.has_path(destination_hash):
             _phase("finding_path")
             deadline = time.time() + path_lookup_timeout
-            while (
-                not RNS.Transport.has_path(destination_hash)
-                and time.time() < deadline
-            ):
-                await asyncio.sleep(_POLL_INTERVAL_S)
+            try:
+                while (
+                    not RNS.Transport.has_path(destination_hash)
+                    and time.time() < deadline
+                ):
+                    await asyncio.sleep(_POLL_INTERVAL_S)
+            except asyncio.CancelledError:
+                # No link object yet — nothing to tear down. Just propagate.
+                raise
         if not RNS.Transport.has_path(destination_hash):
             return None, False, "no_path_to_destination"
 
@@ -189,8 +193,18 @@ class RnsLinkManager:
         )
 
         deadline = time.time() + link_establishment_timeout
-        while link.status is not RNS.Link.ACTIVE and time.time() < deadline:
-            await asyncio.sleep(_POLL_INTERVAL_S)
+        try:
+            while link.status is not RNS.Link.ACTIVE and time.time() < deadline:
+                await asyncio.sleep(_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            # Caller bailed (typically: WS client disconnected). Tear down the
+            # half-built link so it doesn't sit half-established consuming
+            # RNS bookkeeping for the destination.
+            try:
+                link.teardown()
+            except Exception:
+                pass
+            raise
         if link.status is not RNS.Link.ACTIVE:
             try:
                 link.teardown()
