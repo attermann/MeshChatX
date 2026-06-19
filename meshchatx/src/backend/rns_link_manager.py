@@ -277,12 +277,14 @@ class RnsLinkManager:
     def close(self, destination_hash: bytes, aspect: str) -> bool:
         link = get_cached_active_link(aspect, destination_hash)
         if link is None:
+            print(f"[rns_link_manager.close] no cached link for aspect={aspect} dest={destination_hash.hex()}")
             return False
         _uncache_link_if_matches(aspect, destination_hash, link)
         try:
+            print(f"[rns_link_manager.close] calling link.teardown() aspect={aspect} dest={destination_hash.hex()}")
             link.teardown()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[rns_link_manager.close] teardown raised: {e}")
         return True
 
     def _on_packet(self, aspect: str, destination_hash: bytes, data: bytes) -> None:
@@ -299,6 +301,7 @@ class RnsLinkManager:
             pass
 
     def _on_link_closed(self, aspect: str, destination_hash: bytes, link) -> None:
+        print(f"[rns_link_manager] link_closed callback aspect={aspect} dest={destination_hash.hex()}")
         _uncache_link_if_matches(aspect, destination_hash, link)
         try:
             self._broadcast({

@@ -401,6 +401,14 @@ class ReticulumMeshChat:
         # broadcast events.
         self._rns_link_tasks: dict[web.WebSocketResponse, set[asyncio.Task]] = {}
 
+        # Anchor RequestReceipts returned by link.request() for the lifetime of
+        # the request. Keyed by (client, request_id). Removed when the
+        # response/failed callbacks fire, or in bulk when the client disconnects.
+        # Without holding the receipt somewhere, the callback closures still
+        # work (RNS keeps the receipt in link.pending_requests) but matches the
+        # convention used by NomadnetDownloader.
+        self._rns_request_receipts: dict = {}
+
     # Proxy properties for backward compatibility
     @property
     def identity(self):
@@ -16129,11 +16137,16 @@ class ReticulumMeshChat:
 
     def _cancel_rns_link_tasks_for_client(self, client) -> None:
         bucket = self._rns_link_tasks.pop(client, None)
-        if not bucket:
-            return
-        for task in bucket:
-            if not task.done():
-                task.cancel()
+        if bucket:
+            for task in bucket:
+                if not task.done():
+                    task.cancel()
+        # Also drop any RequestReceipts anchored against this client.
+        # Callbacks may still fire after this on RNS-side completion; they
+        # already swallow send_str errors when the client is gone.
+        stale_keys = [k for k in self._rns_request_receipts if k[0] is client]
+        for k in stale_keys:
+            self._rns_request_receipts.pop(k, None)
 
     @staticmethod
     def _rns_link_parse_dest_aspect(data):
@@ -16222,16 +16235,41 @@ class ReticulumMeshChat:
                 "status": "failure", "failure_reason": "missing_path",
             })
             return
+        # data_b64 is the msgpack-encoded request payload. We decode it back
+        # to a native Python value so RNS.Link.request can embed it in the
+        # outer request envelope natively (Python RNS does
+        #     umsgpack.packb([timestamp, path_hash, data])
+        # recursively). Passing raw bytes to link.request would msgpack-wrap
+        # them as a `bin` type, which most Reticulum handlers don't expect
+        # (they want to decode the data slot as the structure the caller
+        # originally encoded — see Link.cpp's pack_response_envelope comment
+        # in microReticulum for the wire-compatibility argument). If a caller
+        # wants to send opaque bytes, they msgpack-encode them as a `bin`
+        # value before sending; the unpacked Python value is then `bytes`
+        # again, which link.request will encode as `bin` on the wire.
         import base64
         data_b64 = data.get("data_b64")
         try:
-            body = base64.b64decode(data_b64) if data_b64 else None
+            body_bytes = base64.b64decode(data_b64) if data_b64 else None
         except Exception:
             await self._rns_link_send(client, {
                 "type": "rns.link.request", "request_id": request_id,
                 "status": "failure", "failure_reason": "invalid_data_b64",
             })
             return
+        if body_bytes is None or len(body_bytes) == 0:
+            link_request_data = None
+        else:
+            try:
+                from RNS.vendor import umsgpack
+                link_request_data = umsgpack.unpackb(body_bytes)
+            except Exception as e:
+                await self._rns_link_send(client, {
+                    "type": "rns.link.request", "request_id": request_id,
+                    "status": "failure",
+                    "failure_reason": f"data_msgpack_decode_failed: {e}",
+                })
+                return
         timeout = data.get("timeout")
 
         # ensure the link is open (don't auto-identify; callers do that explicitly)
@@ -16255,14 +16293,29 @@ class ReticulumMeshChat:
             return
 
         def on_response(request_receipt):
+            self._rns_request_receipts.pop((client, request_id), None)
             raw = request_receipt.response
-            if raw is None:
-                body_b64 = ""
-            elif isinstance(raw, (bytes, bytearray)):
-                body_b64 = base64.b64encode(bytes(raw)).decode("ascii")
-            elif isinstance(raw, str):
-                body_b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
-            else:
+            raw_type = type(raw).__name__
+            print(f"[rns.link.request] on_response req={request_id} type={raw_type}")
+            # body_b64 is always the msgpack encoding of whatever the handler
+            # returned. The caller will msgpack-decode it back to a native
+            # value. Symmetric with the request side, and matches Reticulum's
+            # wire convention where the data slot in the Link envelope is a
+            # msgpack-typed value (not opaque bytes).
+            #
+            # Special case: io.BufferedReader (Resource-style large responses)
+            # gets read out first; the resulting bytes are then msgpack-encoded
+            # as a bin value, identical to what the handler would have produced
+            # had it returned bytes directly.
+            from RNS.vendor import umsgpack
+            try:
+                if hasattr(raw, "read") and not isinstance(raw, (bytes, bytearray)):
+                    raw_to_pack = raw.read()
+                else:
+                    raw_to_pack = raw
+                body_b64 = base64.b64encode(umsgpack.packb(raw_to_pack)).decode("ascii")
+            except Exception as e:
+                print(f"[rns.link.request] on_response req={request_id} msgpack encode failed: {e}")
                 body_b64 = ""
             AsyncUtils.run_async(self._rns_link_send(client, {
                 "type": "rns.link.request", "request_id": request_id,
@@ -16271,6 +16324,8 @@ class ReticulumMeshChat:
             }))
 
         def on_failed(_receipt=None):
+            self._rns_request_receipts.pop((client, request_id), None)
+            print(f"[rns.link.request] on_failed req={request_id}")
             AsyncUtils.run_async(self._rns_link_send(client, {
                 "type": "rns.link.request", "request_id": request_id,
                 "status": "failure", "failure_reason": "request_failed",
@@ -16278,6 +16333,7 @@ class ReticulumMeshChat:
             }))
 
         def on_progress(receipt):
+            print(f"[rns.link.request] on_progress req={request_id} progress={receipt.progress}")
             AsyncUtils.run_async(self._rns_link_send(client, {
                 "type": "rns.link.request", "request_id": request_id,
                 "status": "progress", "progress": receipt.progress,
@@ -16285,13 +16341,26 @@ class ReticulumMeshChat:
             }))
 
         try:
-            self.rns_link_manager.request(
-                dest_hash, aspect, path, body,
+            body_len = -1 if body_bytes is None else len(body_bytes)
+            print(f"[rns.link.request] dispatching req={request_id} path={path} body_len={body_len} link_data_type={type(link_request_data).__name__} timeout={timeout}")
+            # Hold the RequestReceipt for the duration of this handler task.
+            # NomadnetDownloader stores it as self.request_receipt; RNS does
+            # track receipts internally in link.pending_requests, but keeping
+            # a local reference is the de-facto convention and removes any
+            # ambiguity about callback anchoring.
+            receipt = self.rns_link_manager.request(
+                dest_hash, aspect, path, link_request_data,
                 response_callback=on_response,
                 failed_callback=on_failed,
                 progress_callback=on_progress,
                 timeout=timeout,
             )
+            print(f"[rns.link.request] dispatched req={request_id} receipt={receipt!r}")
+            # Keep the receipt anchored against this client+request_id so it
+            # survives the handler-task lifetime. Cleaned up when the receipt
+            # completes (response_callback / failed_callback fired) — RNS
+            # transitions request_receipt.status away from SENT at that point.
+            self._rns_request_receipts[(client, request_id)] = receipt
         except Exception as e:
             await self._rns_link_send(client, {
                 "type": "rns.link.request", "request_id": request_id,
@@ -16330,12 +16399,15 @@ class ReticulumMeshChat:
         request_id = data.get("request_id")
         dest_hash, aspect, err = self._rns_link_parse_dest_aspect(data)
         if err:
+            print(f"[rns.link.close] req={request_id} bad params: {err}")
             await self._rns_link_send(client, {
                 "type": "rns.link.close", "request_id": request_id,
                 "status": "failure", "failure_reason": err,
             })
             return
+        print(f"[rns.link.close] req={request_id} aspect={aspect} dest={dest_hash.hex()}")
         ok = self.rns_link_manager.close(dest_hash, aspect)
+        print(f"[rns.link.close] req={request_id} torn_down={ok}")
         await self._rns_link_send(client, {
             "type": "rns.link.close", "request_id": request_id,
             "status": "success" if ok else "failure",
