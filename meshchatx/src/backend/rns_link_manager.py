@@ -17,6 +17,17 @@ from meshchatx.src.backend import reticulum_pathfinding
 rns_cached_links: dict[tuple[str, bytes], "RNS.Link"] = {}
 _rns_links_lock = threading.Lock()
 
+# Per-cache-key count of consecutive RNS.Link request failures. Reset on
+# successful response; cleared whenever the cached link at the key is
+# replaced or evicted. Guarded by _rns_links_lock (same lock as the cache —
+# the two are mutated together).
+_link_failure_counts: dict[tuple[str, bytes], int] = {}
+
+# Number of consecutive request failures on a cached link that triggers a
+# teardown + cache eviction. The next request to the same destination will
+# then go through the full open_link path and re-establish.
+_LINK_RECYCLE_FAILURE_THRESHOLD = 2
+
 # Wait granularity while polling for path / link (seconds).
 _POLL_INTERVAL_S = 0.02
 
@@ -42,13 +53,22 @@ def sweep_stale_links():
         stale = [k for k, v in rns_cached_links.items() if v.status is not RNS.Link.ACTIVE]
         for k in stale:
             del rns_cached_links[k]
+        # Drop counter entries whose link is no longer cached so the dict
+        # cannot grow unbounded across link churn.
+        orphans = [k for k in _link_failure_counts if k not in rns_cached_links]
+        for k in orphans:
+            del _link_failure_counts[k]
 
 
 def _cache_link_if_active(aspect: str, destination_hash: bytes, link) -> None:
     if link is None or link.status is not RNS.Link.ACTIVE:
         return
+    key = (aspect, destination_hash)
     with _rns_links_lock:
-        rns_cached_links[(aspect, destination_hash)] = link
+        rns_cached_links[key] = link
+        # A freshly cached link starts with a clean failure count, even if
+        # an older link at the same key died with a non-zero count.
+        _link_failure_counts.pop(key, None)
 
 
 def _uncache_link_if_matches(aspect: str, destination_hash: bytes, link) -> None:
@@ -61,6 +81,36 @@ def _uncache_link_if_matches(aspect: str, destination_hash: bytes, link) -> None
                 del rns_cached_links[key]
             except KeyError:
                 pass
+            _link_failure_counts.pop(key, None)
+
+
+def _reset_failure_count(key: tuple[str, bytes]) -> None:
+    with _rns_links_lock:
+        _link_failure_counts.pop(key, None)
+
+
+def _record_failure_and_maybe_recycle(key: tuple[str, bytes]) -> tuple[int, bool]:
+    """Increment the failure counter for `key`.
+
+    If the threshold is reached, pop the cached link, clear the counter,
+    and tear the link down outside the lock (teardown synchronously
+    re-enters via _on_link_closed → _uncache_link_if_matches).
+    Returns (new_count, recycled).
+    """
+    link_to_teardown = None
+    with _rns_links_lock:
+        n = _link_failure_counts.get(key, 0) + 1
+        if n < _LINK_RECYCLE_FAILURE_THRESHOLD:
+            _link_failure_counts[key] = n
+            return n, False
+        link_to_teardown = rns_cached_links.pop(key, None)
+        _link_failure_counts.pop(key, None)
+    if link_to_teardown is not None:
+        try:
+            link_to_teardown.teardown()
+        except Exception as e:
+            print(f"[rns_link_manager] recycle teardown raised: {e}")
+    return n, True
 
 
 def _split_aspect(aspect: str) -> tuple[str, list[str]]:
@@ -255,11 +305,36 @@ class RnsLinkManager:
         link = get_cached_active_link(aspect, destination_hash)
         if link is None:
             raise RuntimeError("no_active_link")
+
+        key = (aspect, destination_hash)
+
+        def _wrapped_response(receipt, _cb=response_callback, _key=key):
+            _reset_failure_count(_key)
+            _cb(receipt)
+
+        def _wrapped_failed(receipt=None, _cb=failed_callback, _key=key):
+            _count, recycled = _record_failure_and_maybe_recycle(_key)
+            if recycled:
+                # The cached link has been torn down and evicted; the next
+                # rns.link.request to this destination will re-establish.
+                # The existing link_closed event already fires from
+                # _on_link_closed via link.teardown(), so clients that watch
+                # for it can react.
+                #
+                # Future enhancement (option B from design): broadcast a
+                # dedicated rns.link.event with
+                # event="link_recycled_after_failures", failures=_count,
+                # destination_hash=_key[1].hex(), aspect=_key[0] — useful
+                # for UIs that want to surface "link reset after N failures"
+                # diagnostics distinct from a plain link_closed.
+                pass
+            _cb(receipt)
+
         return link.request(
             path,
             data=data,
-            response_callback=response_callback,
-            failed_callback=failed_callback,
+            response_callback=_wrapped_response,
+            failed_callback=_wrapped_failed,
             progress_callback=progress_callback,
             timeout=timeout,
         )
