@@ -407,9 +407,11 @@
                         nomadRenderedShellFullBleed
                             ? 'p-0 bg-transparent min-h-full text-gray-900 dark:text-gray-100'
                             : 'p-3 bg-black text-white',
+                        nomadShellDark ? 'nomad-shell-dark' : '',
                     ]"
                     :style="nodeContainerShellStyle"
                     @click.capture="onElementClick"
+                    @auxclick.capture="onElementClick"
                 >
                     <!-- archived version notice -->
                     <div
@@ -613,13 +615,17 @@ export default {
             type: Boolean,
             default: false,
         },
+        tabsEnabled: {
+            type: Boolean,
+            default: false,
+        },
         initialPath: {
             type: String,
             required: false,
             default: null,
         },
     },
-    emits: ["navigate", "close-tab"],
+    emits: ["navigate", "open-node", "close-tab"],
     data() {
         return {
             GlobalState,
@@ -852,6 +858,28 @@ export default {
                 return null;
             }
             return { background: this.pageShellBackground };
+        },
+        nomadShellDark() {
+            if (!this.nomadRenderedShellFullBleed) {
+                return true;
+            }
+            const bg = this.pageShellBackground;
+            if (!bg || typeof bg !== "string") {
+                return false;
+            }
+            const lower = bg.toLowerCase().replace(/\s/g, "");
+            if (lower === "#000" || lower === "#000000" || lower === "black" || lower === "rgb(0,0,0)") {
+                return true;
+            }
+            const rgbMatch = lower.match(/^rgba?\((\d+),(\d+),(\d+)/);
+            if (rgbMatch) {
+                const r = Number(rgbMatch[1]);
+                const g = Number(rgbMatch[2]);
+                const b = Number(rgbMatch[3]);
+                const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                return luminance < 0.45;
+            }
+            return false;
         },
         nomadRenderedShellFullBleed() {
             if (!this.nodePagePath || this.isShowingNodePageSource) {
@@ -1144,6 +1172,35 @@ export default {
                 (b) => b.destination_hash === identityHash
             );
         },
+        getLinkNavOptions(event) {
+            const modifierClick = event.ctrlKey || event.metaKey;
+            const middleClick = event.button === 1;
+            return {
+                forceNewTab: modifierClick || middleClick,
+                activate: !modifierClick && !middleClick,
+            };
+        },
+        shouldOpenInNewTab(destinationHash, navOptions = {}) {
+            if (!this.embedded || !this.tabsEnabled) {
+                return false;
+            }
+            if (navOptions.forceNewTab) {
+                return true;
+            }
+            if (!destinationHash || !this.destinationHash) {
+                return false;
+            }
+            return destinationHash !== this.destinationHash;
+        },
+        emitOpenNode(destinationHash, pagePath, title = null, navOptions = {}) {
+            this.$emit("open-node", {
+                destinationHash,
+                pagePath,
+                title,
+                activate: navOptions.activate !== false,
+                forceNewTab: navOptions.forceNewTab === true,
+            });
+        },
         onElementClick(event) {
             const nomadLink = event.target.closest("a.nomadnet-link[data-nomadnet-url]");
             if (nomadLink) {
@@ -1151,9 +1208,21 @@ export default {
                 event.stopPropagation();
                 const url = nomadLink.getAttribute("data-nomadnet-url");
                 if (url) {
-                    this.onNodePageUrlClick(url);
+                    this.onNodePageUrlClick(url, null, true, false, this.getLinkNavOptions(event));
                 }
                 return;
+            }
+
+            const externalAnchor = event.target.closest("a[href]");
+            if (externalAnchor && !externalAnchor.classList.contains("nomadnet-link")) {
+                const href = externalAnchor.getAttribute("href");
+                const httpHref = href ? LinkUtils.httpUrlHrefOrNull(href.trim()) : null;
+                if (httpHref) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    window.open(httpHref, "_blank", "noopener,noreferrer");
+                    return;
+                }
             }
 
             const fragAnchor = event.target.closest("a[href]");
@@ -1186,7 +1255,7 @@ export default {
             const destination = element.getAttribute("data-destination");
             const fields = element.getAttribute("data-fields");
 
-            this.onNodePageUrlClick(destination, fields);
+            this.onNodePageUrlClick(destination, fields, true, false, this.getLinkNavOptions(event));
         },
         async onWebsocketMessage(message) {
             const json = JSON.parse(message.data);
@@ -1606,7 +1675,24 @@ export default {
             // navigate to the url
             await this.onNodePageUrlClick(url);
         },
-        async loadNodePage(destinationHash, pagePath, fieldData = null, addToHistory = true, loadFromCache = true) {
+        async loadNodePage(
+            destinationHash,
+            pagePath,
+            fieldData = null,
+            addToHistory = true,
+            loadFromCache = true,
+            navOptions = {}
+        ) {
+            if (this.shouldOpenInNewTab(destinationHash, navOptions)) {
+                this.emitOpenNode(
+                    destinationHash,
+                    pagePath,
+                    this.selectedNode?.custom_display_name || this.selectedNode?.display_name || null,
+                    navOptions
+                );
+                return;
+            }
+
             // update current route (skipped while embedded; the browser shell owns routing)
             if (this.embedded) {
                 this.$emit("navigate", {
@@ -2030,7 +2116,7 @@ export default {
             // unsupported url
             return null;
         },
-        async onNodePageUrlClick(url, options = null, addToHistory = true, useCache = false) {
+        async onNodePageUrlClick(url, options = null, addToHistory = true, useCache = false, navOptions = {}) {
             let fieldData = [];
 
             if (options === "*") {
@@ -2219,7 +2305,7 @@ export default {
                 };
 
                 // navigate to node page
-                this.loadNodePage(destinationHash, parsedUrl.path, fieldData, addToHistory, useCache);
+                this.loadNodePage(destinationHash, parsedUrl.path, fieldData, addToHistory, useCache, navOptions);
                 return;
             }
 
@@ -2233,10 +2319,17 @@ export default {
             return Utils.formatBytesPerSecond(bytesPerSecond);
         },
         onNodeClick: function (node) {
-            // update selected node
-            this.selectedNode = node;
+            if (this.shouldOpenInNewTab(node.destination_hash, {})) {
+                this.emitOpenNode(
+                    node.destination_hash,
+                    this.defaultNodePagePath,
+                    node.custom_display_name || node.display_name || null,
+                    { activate: true }
+                );
+                return;
+            }
 
-            // load default node page
+            this.selectedNode = node;
             this.loadNodePage(node.destination_hash, this.defaultNodePagePath);
         },
         async onRenameFavourite(favourite) {
@@ -2618,7 +2711,27 @@ pre.text-wrap > div > :last-child {
     border-radius: 0;
     background: transparent;
     color: inherit;
+    caret-color: currentColor;
+    -webkit-text-fill-color: currentColor;
     box-sizing: content-box;
+}
+
+.nodeContainer.bg-black input[type="text"],
+.nodeContainer.bg-black input[type="password"],
+.nodeContainer.bg-black textarea {
+    color: #f3f4f6 !important;
+    caret-color: #f3f4f6 !important;
+    -webkit-text-fill-color: #f3f4f6 !important;
+    border-bottom-color: #f3f4f6 !important;
+}
+
+.nodeContainer.nomad-shell-dark input[type="text"],
+.nodeContainer.nomad-shell-dark input[type="password"],
+.nodeContainer.nomad-shell-dark textarea {
+    color: #f3f4f6 !important;
+    caret-color: #f3f4f6 !important;
+    -webkit-text-fill-color: #f3f4f6 !important;
+    border-bottom-color: #f3f4f6 !important;
 }
 
 .nomad-markdown-host {

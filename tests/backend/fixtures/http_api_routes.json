@@ -13,6 +13,10 @@
             "path": "/api/v1/announces"
         },
         {
+            "method": "POST",
+            "path": "/api/v1/announces/query"
+        },
+        {
             "method": "GET",
             "path": "/api/v1/app/changelog"
         },
@@ -477,6 +481,22 @@
             "path": "/api/v1/lxmf/sieve-filters"
         },
         {
+            "method": "GET",
+            "path": "/api/v1/lxmf/message-blocklist"
+        },
+        {
+            "method": "PUT",
+            "path": "/api/v1/lxmf/message-blocklist"
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/lxmf/message-blocklist/export"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/lxmf/message-blocklist/import"
+        },
+        {
             "method": "DELETE",
             "path": "/api/v1/maintenance/announces"
         },
@@ -515,6 +535,10 @@
         {
             "method": "POST",
             "path": "/api/v1/maintenance/messages/import-file"
+        },
+        {
+            "method": "DELETE",
+            "path": "/api/v1/maintenance/path-table"
         },
         {
             "method": "DELETE",
@@ -859,6 +883,10 @@
         {
             "method": "GET",
             "path": "/api/v1/rnsh/sessions/{session_id}/output"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/rnsh/sessions/{session_id}/resize"
         },
         {
             "method": "POST",

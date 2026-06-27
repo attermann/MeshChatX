@@ -6,6 +6,7 @@ import GlobalState from "@/js/GlobalState";
 import DialogUtils from "@/js/DialogUtils";
 import ToastUtils from "@/js/ToastUtils";
 import { MESSAGE_BODY_MAX_DISPLAY_CHARS } from "../../meshchatx/src/frontend/js/messageDisplayLimits.js";
+import DownloadUtils from "@/js/DownloadUtils";
 
 vi.mock("@/js/DialogUtils", () => ({
     default: {
@@ -769,6 +770,114 @@ describe("ConversationViewer.vue", () => {
 
         const retryButtons = wrapper.findAll("button").filter((b) => b.text().includes("Retry"));
         expect(retryButtons).toHaveLength(0);
+    });
+
+    it("canCancelOutboundSend is true while outbound message is still sending", () => {
+        const wrapper = mountConversationViewer();
+        const sendingItem = {
+            type: "lxmf_message",
+            is_outbound: true,
+            lxmf_message: {
+                hash: "sending-hash",
+                state: "sending",
+                progress: 12,
+                content: "still going",
+                destination_hash: "test-hash",
+                source_hash: "my-hash",
+                fields: {},
+            },
+        };
+        expect(wrapper.vm.canCancelOutboundSend(sendingItem)).toBe(true);
+        expect(wrapper.vm.canCancelOutboundSend({ ...sendingItem, is_outbound: false })).toBe(false);
+    });
+
+    it("cancelSendingMessage calls cancel API for in-flight outbound hash", async () => {
+        const wrapper = mountConversationViewer();
+        const sendingItem = {
+            type: "lxmf_message",
+            is_outbound: true,
+            is_actions_expanded: true,
+            lxmf_message: {
+                hash: "aa".repeat(16),
+                state: "sending",
+                progress: 40,
+                content: "cancel me",
+                destination_hash: "test-hash",
+                source_hash: "my-hash",
+                fields: {},
+            },
+        };
+        wrapper.vm.chatItems = [sendingItem];
+        const hash = sendingItem.lxmf_message.hash;
+        axiosMock.post.mockResolvedValueOnce({
+            data: { lxmf_message: { ...sendingItem.lxmf_message, state: "cancelled" } },
+        });
+
+        await wrapper.vm.cancelSendingMessage(sendingItem);
+
+        expect(axiosMock.post).toHaveBeenCalledWith(expect.stringContaining(`/lxmf-messages/${hash}/cancel`));
+        expect(sendingItem.is_actions_expanded).toBe(false);
+        expect(wrapper.vm.messageContextMenu.show).toBe(false);
+    });
+
+    it("cancelSendingMessage removes optimistic pending placeholder without API call", async () => {
+        const wrapper = mountConversationViewer();
+        const pendingItem = {
+            type: "lxmf_message",
+            is_outbound: true,
+            lxmf_message: {
+                hash: "pending-abc",
+                state: "sending",
+                content: "queued",
+                destination_hash: "test-hash",
+                source_hash: "my-hash",
+                fields: {},
+            },
+        };
+        wrapper.vm.chatItems = [pendingItem];
+
+        await wrapper.vm.cancelSendingMessage(pendingItem);
+
+        expect(axiosMock.post).not.toHaveBeenCalled();
+        expect(wrapper.vm.chatItems.some((i) => i.lxmf_message?.hash === "pending-abc")).toBe(false);
+    });
+
+    it("downloadLxmfFileAttachment fetches attachment bytes and saves through DownloadUtils", async () => {
+        const saveSpy = vi.spyOn(DownloadUtils, "downloadFromApiResponse").mockResolvedValue(undefined);
+
+        const wrapper = mountConversationViewer();
+        const hash = "ff".repeat(16);
+        const chatItem = {
+            type: "lxmf_message",
+            is_outbound: false,
+            lxmf_message: {
+                hash,
+                state: "delivered",
+                content: "",
+                destination_hash: "test-hash",
+                source_hash: "peer-hash",
+                fields: {
+                    file_attachments: [{ file_name: "doc.pdf", file_size: 42 }],
+                },
+            },
+        };
+
+        axiosMock.get.mockResolvedValueOnce({
+            data: new ArrayBuffer(3),
+            headers: { "content-type": "application/pdf" },
+        });
+
+        await wrapper.vm.downloadLxmfFileAttachment(chatItem, 0);
+
+        expect(axiosMock.get).toHaveBeenCalledWith(
+            `/api/v1/lxmf-messages/attachment/${hash}/file`,
+            expect.objectContaining({
+                params: { file_index: 0 },
+                responseType: "arraybuffer",
+            })
+        );
+        expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({ data: expect.any(ArrayBuffer) }), "doc.pdf");
+        saveSpy.mockRestore();
     });
 
     it("calls retrySendingMessage when retry context menu clicked", async () => {
@@ -2086,6 +2195,111 @@ describe("ConversationViewer.vue", () => {
             };
             const wrapper = mountConversationViewer();
             expect(wrapper.vm.androidNativeWavAttachmentAllowed()).toBe(false);
+        });
+    });
+
+    describe("outbound pending placeholder dedupe", () => {
+        it("removes all pending placeholders for a peer when the real message is created", () => {
+            const wrapper = mountConversationViewer();
+            wrapper.vm.chatItems = [
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "pending-1",
+                        content: "hello",
+                        destination_hash: "test-hash",
+                        state: "sending",
+                        _pendingPathfinding: true,
+                    },
+                },
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "pending-2",
+                        content: "hello",
+                        destination_hash: "TEST-HASH",
+                        state: "sending",
+                    },
+                },
+            ];
+
+            wrapper.vm.onLxmfMessageCreated({
+                hash: "real-hash",
+                content: "hello",
+                destination_hash: "test-hash",
+                source_hash: "my-hash",
+                state: "sending",
+            });
+
+            expect(wrapper.vm.chatItems).toHaveLength(1);
+            expect(wrapper.vm.chatItems[0].lxmf_message.hash).toBe("real-hash");
+        });
+
+        it("hides pending bubbles when a matching real outbound message is already loaded", () => {
+            const wrapper = mountConversationViewer();
+            wrapper.vm.chatItems = [
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "real-hash",
+                        content: "hello",
+                        destination_hash: "test-hash",
+                        source_hash: "my-hash",
+                        state: "failed",
+                    },
+                },
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "pending-1",
+                        content: "hello",
+                        destination_hash: "test-hash",
+                        source_hash: "my-hash",
+                        state: "sending",
+                        _pendingPathfinding: true,
+                    },
+                },
+            ];
+
+            const visible = wrapper.vm.selectedPeerChatItems;
+            expect(visible).toHaveLength(1);
+            expect(visible[0].lxmf_message.hash).toBe("real-hash");
+        });
+
+        it("reconciles pending placeholders after loading conversation history", () => {
+            const wrapper = mountConversationViewer();
+            wrapper.vm.chatItems = [
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "real-hash",
+                        content: "hello",
+                        destination_hash: "test-hash",
+                        source_hash: "my-hash",
+                        state: "failed",
+                    },
+                },
+                {
+                    type: "lxmf_message",
+                    is_outbound: true,
+                    lxmf_message: {
+                        hash: "pending-1",
+                        content: "hello",
+                        destination_hash: "test-hash",
+                        source_hash: "my-hash",
+                        state: "sending",
+                    },
+                },
+            ];
+
+            wrapper.vm.reconcileOutboundPendingPlaceholders();
+            expect(wrapper.vm.chatItems).toHaveLength(1);
+            expect(wrapper.vm.chatItems[0].lxmf_message.hash).toBe("real-hash");
         });
     });
 });

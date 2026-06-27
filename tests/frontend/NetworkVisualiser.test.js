@@ -117,6 +117,21 @@ describe("NetworkVisualiser.vue", () => {
                         data: { path_table: [{ hash: "node1", interface: "eth0", hops: 1 }], total_count: 1 },
                     });
                 }
+                if (url.includes("/api/v1/announces/query")) {
+                    return Promise.resolve({
+                        data: {
+                            announces: [
+                                {
+                                    destination_hash: "node1",
+                                    aspect: "lxmf.delivery",
+                                    display_name: "Remote Node",
+                                    updated_at: new Date().toISOString(),
+                                },
+                            ],
+                            total_count: 1,
+                        },
+                    });
+                }
                 return Promise.resolve({ data: {} });
             }),
             isCancel: vi.fn().mockReturnValue(false),
@@ -397,6 +412,77 @@ describe("NetworkVisualiser.vue", () => {
         expect(wrapper.vm.nodes.getIds()).not.toContain("eth_down");
     });
 
+    it("creates visible edges between local node, interfaces, and peers", async () => {
+        vi.spyOn(NetworkVisualiser.methods, "init").mockImplementation(() => {});
+        const wrapper = mountVisualiser();
+        wrapper.vm.network = {
+            getPositions: vi.fn().mockReturnValue({}),
+            setOptions: vi.fn(),
+            redraw: vi.fn(),
+            on: vi.fn(),
+            destroy: vi.fn(),
+            getScale: vi.fn().mockReturnValue(1),
+        };
+        wrapper.vm.config = { display_name: "Me", identity_hash: "abc" };
+        wrapper.vm.interfaces = [{ name: "eth0", status: true, bitrate: 1000, txb: 0, rxb: 0 }];
+        wrapper.vm.pathTable = [{ hash: "node1", interface: "eth0", hops: 1 }];
+        wrapper.vm.announces = {
+            node1: {
+                destination_hash: "node1",
+                aspect: "lxmf.delivery",
+                display_name: "Remote",
+                updated_at: new Date().toISOString(),
+            },
+        };
+
+        await wrapper.vm.processVisualization();
+
+        expect(wrapper.vm.edges.getIds()).toContain("me~eth0");
+        expect(wrapper.vm.edges.getIds()).toContain("eth0~node1");
+        for (const edge of wrapper.vm.edges.get()) {
+            expect(edge.hidden).not.toBe(true);
+        }
+        const ifaceEdge = wrapper.vm.edges.get("me~eth0");
+        expect(ifaceEdge.color.color).toBe("#10b981");
+        expect(ifaceEdge.arrows.to.enabled).toBe(true);
+        const directPeerEdge = wrapper.vm.edges.get("eth0~node1");
+        expect(directPeerEdge.color.color).toBe("#10b981");
+        expect(directPeerEdge.arrows.to.enabled).toBe(true);
+        expect(directPeerEdge.dashes).not.toBe(true);
+        expect(wrapper.vm.network.redraw).toHaveBeenCalled();
+    });
+
+    it("creates interface nodes and edges from path table when interface-stats is empty", async () => {
+        vi.spyOn(NetworkVisualiser.methods, "init").mockImplementation(() => {});
+        const wrapper = mountVisualiser();
+        wrapper.vm.network = {
+            getPositions: vi.fn().mockReturnValue({}),
+            setOptions: vi.fn(),
+            redraw: vi.fn(),
+            on: vi.fn(),
+            destroy: vi.fn(),
+            getScale: vi.fn().mockReturnValue(1),
+        };
+        wrapper.vm.config = { display_name: "Me", identity_hash: "abc" };
+        wrapper.vm.interfaces = [];
+        const iface = "BackboneInterface[0rbit Iceland/93.95.227.8:49952]";
+        wrapper.vm.pathTable = [{ hash: "node1", interface: iface, hops: 2 }];
+        wrapper.vm.announces = {
+            node1: {
+                destination_hash: "node1",
+                aspect: "lxmf.delivery",
+                display_name: "Remote",
+                updated_at: new Date().toISOString(),
+            },
+        };
+
+        await wrapper.vm.processVisualization();
+
+        expect(wrapper.vm.nodes.getIds()).toContain(iface);
+        expect(wrapper.vm.edges.getIds()).toContain(`me~${iface}`);
+        expect(wrapper.vm.edges.getIds()).toContain(`${iface}~node1`);
+    });
+
     it("keeps node positions from getPositions on subsequent layout passes", async () => {
         vi.spyOn(NetworkVisualiser.methods, "init").mockImplementation(() => {});
         const wrapper = mountVisualiser();
@@ -410,6 +496,7 @@ describe("NetworkVisualiser.vue", () => {
         wrapper.vm.network = {
             getPositions,
             setOptions: vi.fn(),
+            redraw: vi.fn(),
             on: vi.fn(),
             destroy: vi.fn(),
         };

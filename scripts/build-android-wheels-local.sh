@@ -25,7 +25,7 @@ Options:
   --api-level N              Android API level for wheel tag (default: 24)
   --pycodec2-version V       pycodec2 version to build (default: 4.1.1)
   --numpy-version V          NumPy version used during pycodec2 build (default: 1.26.2)
-  --lxst-version V           LXST wheel version for metadata patch (default: 0.4.6)
+  --lxst-version V           LXST wheel version for metadata patch (default: 0.4.7)
   --no-lxst-patch            Skip LXST metadata patch
   --only-recipes LIST        Comma-separated recipe directory names under
                              android/chaquopy-recipes to build. When set, the
@@ -52,7 +52,7 @@ API_LEVEL="24"
 PYCODEC2_VERSION="4.1.1"
 LIBCODEC2_VERSION="1.2.0"
 NUMPY_VERSION="1.26.2"
-LXST_VERSION="0.4.6"
+LXST_VERSION="0.4.7"
 PATCH_LXST="1"
 ONLY_RECIPES=""
 WORK_DIR="${ROOT_DIR}/.local/chaquopy-build-wheel"
@@ -160,6 +160,7 @@ require_cmd curl
 require_cmd sed
 require_cmd awk
 require_cmd sort
+require_cmd patchelf
 
 case ",${ABI_LIST}," in
     *,armeabi-v7a,*)
@@ -204,6 +205,76 @@ fi
 echo "Using Chaquopy git ref: ${CHAQUOPY_REF}"
 echo "Using Chaquopy target version: ${TARGET_VERSION}"
 
+apply_chaquopy_libpython3_link_fix() {
+    "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+import os
+import sys
+
+path = Path(os.environ["BUILD_WHEEL_PY"])
+text = path.read_text()
+changed = False
+
+if "chaquopy_python_abi3_link" not in text:
+    needle = '                    run(f"ln -s {filename} {reqs_lib_dir}/{link_filename}")'
+    if needle not in text:
+        print("Could not find SONAME symlink loop in build-wheel.py", file=sys.stderr)
+        sys.exit(1)
+    insert = needle + """
+
+        # PyO3 0.29 abi3 Android builds link libpython3.so (PEP 738).
+        python_soname = f"libpython{self.python}.so"
+        python_abi3_link = "libpython3.so"
+        if exists(f"{reqs_lib_dir}/{python_soname}") and not exists(f"{reqs_lib_dir}/{python_abi3_link}"):
+            run(f"ln -s {python_soname} {reqs_lib_dir}/{python_abi3_link}")"""
+    text = text.replace(needle, insert, 1)
+    changed = True
+
+if "chaquopy_python_abi3_needed" not in text:
+    needle = """                elif tag.needed in available_libs:
+                    pass
+                else:
+                    raise CommandError(f"{filename} is linked against unknown library "
+                                       f"'{tag.needed}'.")"""
+    if needle not in text:
+        print("Could not find check_requirements validation in build-wheel.py", file=sys.stderr)
+        sys.exit(1)
+    insert = """                elif tag.needed in available_libs:
+                    pass
+                elif (
+                    tag.needed == "libpython3.so"  # chaquopy_python_abi3_needed
+                    and exists(self.python_lib)
+                ):
+                    pass
+                else:
+                    raise CommandError(f"{filename} is linked against unknown library "
+                                       f"'{tag.needed}'.")"""
+    text = text.replace(needle, insert, 1)
+    changed = True
+
+if "chaquopy_python_abi3_available_lib" not in text:
+    needle = "                            available_libs.add(name)\n\n        reqs = set()"
+    if needle not in text:
+        print("Could not find available_libs loop in build-wheel.py fix_wheel", file=sys.stderr)
+        sys.exit(1)
+    insert = """                            available_libs.add(name)
+
+        python_soname = f"libpython{self.python}.so"
+        if python_soname in available_libs:
+            available_libs.add("libpython3.so")
+
+        reqs = set()"""
+    text = text.replace(needle, insert, 1)
+    changed = True
+
+if changed:
+    path.write_text(text)
+    print("Applied libpython3.so Chaquopy build-wheel fixes")
+else:
+    print("libpython3.so Chaquopy build-wheel fixes already present")
+PY
+}
+
 pushd "${CHAQUOPY_DIR}" >/dev/null
 TARGET_PATH="maven/com/chaquo/python/target/${TARGET_VERSION}"
 if [[ ! -d "${TARGET_PATH}" ]]; then
@@ -214,6 +285,8 @@ fi
 popd >/dev/null
 
 PYPIDIR="${CHAQUOPY_DIR}/server/pypi"
+export BUILD_WHEEL_PY="${PYPIDIR}/build-wheel.py"
+apply_chaquopy_libpython3_link_fix
 VENV_DIR="${PYPIDIR}/.venv-local"
 rm -rf "${VENV_DIR}"
 "${PYTHON_BIN}" -m venv "${VENV_DIR}"
@@ -665,6 +738,61 @@ with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w", compression=zip
 PY
 fi
 
+fix_wheel_libpython_needed() {
+    local wheel="$1"
+    local python_soname="$2"
+    PYTHON_SONAME="${python_soname}" "${VENV_DIR}/bin/python" - "${wheel}" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+wheel = Path(sys.argv[1])
+old_soname = "libpython3.so"
+new_soname = os.environ["PYTHON_SONAME"]
+
+def patch_so(data):
+    with tempfile.NamedTemporaryFile(suffix=".so", delete=False) as handle:
+        handle.write(data)
+        so_path = handle.name
+    try:
+        result = subprocess.run(
+            ["patchelf", "--print-needed", so_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or old_soname not in result.stdout.split():
+            return None
+        subprocess.run(
+            ["patchelf", "--replace-needed", old_soname, new_soname, so_path],
+            check=True,
+        )
+        return Path(so_path).read_bytes()
+    finally:
+        Path(so_path).unlink(missing_ok=True)
+
+changed = False
+tmp = wheel.with_suffix(".tmp.whl")
+with zipfile.ZipFile(wheel, "r") as zin, zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename.endswith(".so"):
+            patched = patch_so(data)
+            if patched is not None:
+                data = patched
+                changed = True
+        zout.writestr(item, data)
+
+if changed:
+    tmp.replace(wheel)
+    print(f"Rewrote {old_soname} -> {new_soname} in {wheel.name}")
+else:
+    tmp.unlink(missing_ok=True)
+PY
+}
+
 CUSTOM_RECIPES_DIR="${ROOT_DIR}/android/chaquopy-recipes"
 ONLY_RECIPES_FILTER=""
 if [[ -n "${ONLY_RECIPES}" ]]; then
@@ -717,7 +845,10 @@ PY
                 echo "Missing wheel output for ${PACKAGE_NAME} ${PACKAGE_VERSION} ${abi}" >&2
                 exit 1
             fi
-            cp -f ${WHEEL_GLOB} "${OUT_DIR}/"
+            for built_wheel in ${WHEEL_GLOB}; do
+                cp -f "${built_wheel}" "${OUT_DIR}/"
+                fix_wheel_libpython_needed "${OUT_DIR}/$(basename "${built_wheel}")" "libpython${PYTHON_MINOR}.so"
+            done
         done
 
         if [[ "${PACKAGE_NAME}" == "cryptography" ]]; then

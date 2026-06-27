@@ -26,13 +26,20 @@
             :has-failed-or-cancelled-messages="hasFailedOrCancelledMessages"
             :message-icon-style="messageIconStyle"
             :selected-peer-path="selectedPeerPath"
+            :peer-path-snapshot="peerPathSnapshot"
+            :peer-path-loading="peerPathLoading"
+            :peer-path-warming="peerPathWarming"
             :selected-peer-signal-metrics="selectedPeerSignalMetrics"
             :selected-peer-lxmf-stamp-info="selectedPeerLxmfStampInfo"
+            :pathfinder-in-progress="pathfinderInProgress"
             @edit-display-name="updateCustomDisplayName"
             @copy-hash="copyHash"
             @destination-path-click="onDestinationPathClick"
             @signal-metrics-click="onSignalMetricsClick"
             @stamp-info-click="onStampInfoClick"
+            @path-finder-quick="runPathFinderQuickRequest"
+            @path-finder-force="runPathFinderForceFind"
+            @path-finder-drop="runPathFinderDropAndRequest"
             @conversation-deleted="onConversationDeleted"
             @popout="openConversationPopout"
             @retry-failed="retryAllFailedOrCancelledMessages"
@@ -183,7 +190,7 @@
                         :class="useVirtualMessageList ? 'relative flex flex-col' : ''"
                     >
                         <template v-if="!useVirtualMessageList">
-                            <div class="flex flex-col flex-col-reverse min-w-0">
+                            <div class="flex flex-col flex-col-reverse min-w-0 [overflow-anchor:none]">
                                 <template
                                     v-for="entry in selectedPeerChatDisplayGroupsNewestFirstAugmented"
                                     :key="entry.key"
@@ -1009,6 +1016,13 @@
                 </ContextMenuItem>
                 <ContextMenuItem
                     v-if="messageContextMenu.chatItem?.lxmf_message?.fields?.image"
+                    @click="downloadMessageImage(messageContextMenu.chatItem)"
+                >
+                    <MaterialDesignIcon icon-name="download" class="size-4 text-blue-500" />
+                    {{ $t("messages.save_image_to_device") }}
+                </ContextMenuItem>
+                <ContextMenuItem
+                    v-if="messageContextMenu.chatItem?.lxmf_message?.fields?.image"
                     @click="saveMessageImageToStickers(messageContextMenu.chatItem)"
                 >
                     <MaterialDesignIcon icon-name="bookmark-plus-outline" class="size-4 text-teal-500" />
@@ -1020,6 +1034,14 @@
                 >
                     <MaterialDesignIcon icon-name="file-gif-box" class="size-4 text-pink-500" />
                     {{ $t("gifs.save_to_library") }}
+                </ContextMenuItem>
+                <ContextMenuItem
+                    v-if="canCancelOutboundSend(messageContextMenu.chatItem)"
+                    item-class="text-amber-600 dark:text-amber-400"
+                    @click="cancelSendingMessage(messageContextMenu.chatItem)"
+                >
+                    <MaterialDesignIcon icon-name="close-circle-outline" class="size-4" />
+                    {{ $t("messages.cancel_send") }}
                 </ContextMenuItem>
                 <ContextMenuItem
                     v-if="
@@ -1716,6 +1738,9 @@ import {
 import {
     isTelemetryOnly as isTelemetryOnlyMessage,
     hasRenderableContent as messageHasRenderableContent,
+    hasFileAttachments as messageHasFileAttachments,
+    hasMessageBubble as computeHasMessageBubble,
+    isFileOnlyMessage as computeIsFileOnlyMessage,
     isImageOnlyMessage as computeIsImageOnlyMessage,
     collectImageFilesFromDataTransfer as collectImagesFromDataTransfer,
     extractClipboardImageFiles,
@@ -1725,7 +1750,13 @@ import ConversationMessageEntry from "./ConversationMessageEntry.vue";
 import ConversationMessageListVirtual from "./ConversationMessageListVirtual.vue";
 import { displayGroupsOldestFirst, MIN_VIRTUAL_DISPLAY_GROUPS } from "./messageListVirtual.js";
 import DialogUtils from "../../js/DialogUtils";
-import { getDestinationPath, postRequestPath } from "../../js/reticulumPathfinding.js";
+import {
+    fetchPeerPathSnapshot,
+    normalizePathSnapshot,
+    pathNeedsRefresh,
+    runDestinationPathFinder,
+    warmPathIfNeeded,
+} from "../../js/reticulumPathfinding.js";
 import MicrophoneRecorder from "../../js/MicrophoneRecorder";
 import WebSocketConnection from "../../js/WebSocketConnection";
 import AddAudioButton from "./AddAudioButton.vue";
@@ -1805,9 +1836,13 @@ export default {
     data() {
         return {
             GlobalState,
-            selectedPeerPath: null,
+            peerPathSnapshot: null,
+            peerPathLoading: false,
+            peerPathWarming: false,
+            peerPathRequestSequence: 0,
             selectedPeerLxmfStampInfo: null,
             selectedPeerSignalMetrics: null,
+            pathfinderInProgress: false,
 
             lxmfMessagesRequestSequence: 0,
             chatItems: [],
@@ -1932,6 +1967,9 @@ export default {
         },
         compactPeerActions() {
             return this.windowWidth < 640 || this.peerHeaderCompact;
+        },
+        selectedPeerPath() {
+            return this.peerPathSnapshot?.path ?? null;
         },
         compactSendLayout() {
             return this.windowWidth < 640 || this.peerHeaderCompact;
@@ -2167,7 +2205,7 @@ export default {
             // get all chat items related to the selected peer
             if (this.selectedPeer) {
                 const peer = (this.selectedPeer.destination_hash || "").toLowerCase();
-                return this.chatItems.filter((chatItem) => {
+                const items = this.chatItems.filter((chatItem) => {
                     if (chatItem.type === "lxmf_message") {
                         const src = (chatItem.lxmf_message.source_hash || "").toLowerCase();
                         const dst = (chatItem.lxmf_message.destination_hash || "").toLowerCase();
@@ -2194,6 +2232,7 @@ export default {
 
                     return false;
                 });
+                return this._hideRedundantOutboundPendingItems(items);
             }
 
             // no peer, so no chat items!
@@ -3096,7 +3135,9 @@ export default {
             this.messagesViewportReady = false;
             this.chatItems = [];
             this.hasMorePrevious = true;
-            this.selectedPeerPath = null;
+            this.peerPathSnapshot = null;
+            this.peerPathLoading = false;
+            this.peerPathWarming = false;
             this.selectedPeerLxmfStampInfo = null;
             this.selectedPeerSignalMetrics = null;
             if (!this.selectedPeer) {
@@ -3108,14 +3149,14 @@ export default {
             await this.$nextTick();
             this.resetStaleConversationScrollSurface();
 
-            this.getPeerPath();
+            this.refreshPeerPath({ warm: true });
             this.getPeerLxmfStampInfo();
             this.getPeerSignalMetrics();
-            this.warmPathToPeer();
 
             this.markConversationAsRead(this.selectedPeer);
 
             await this.loadPrevious();
+            this.reconcileOutboundPendingPlaceholders();
 
             await this.$nextTick();
             await this.$nextTick();
@@ -3341,7 +3382,7 @@ export default {
                 case "announce": {
                     // update stamp info and signal metrics if an announce is received from the selected peer
                     if (json.announce.destination_hash === this.selectedPeer?.destination_hash) {
-                        await this.getPeerPath();
+                        await this.refreshPeerPath({ warm: true });
                         await this.getPeerLxmfStampInfo();
                         await this.getPeerSignalMetrics();
                     }
@@ -3349,13 +3390,13 @@ export default {
                 }
                 case "lxmf.delivery": {
                     this.onLxmfMessageReceived(json.lxmf_message);
-                    await this.getPeerPath();
+                    await this.refreshPeerPath({ warm: false });
                     await this.getPeerSignalMetrics();
                     break;
                 }
                 case "lxmf_message_created": {
                     this.onLxmfMessageCreated(json.lxmf_message);
-                    await this.getPeerPath();
+                    await this.refreshPeerPath({ warm: false });
                     break;
                 }
                 case "lxmf_message_state_updated": {
@@ -3498,7 +3539,8 @@ export default {
                 return;
             }
 
-            this.removeFirstPendingOutboundPlaceholderForPeer(lxmfMessage.destination_hash);
+            this.removeAllPendingOutboundPlaceholdersForPeer(lxmfMessage.destination_hash);
+            this.reconcileOutboundPendingPlaceholders(lxmfMessage);
 
             if (!this.isLxmfMessageInUi(lxmfMessage.hash)) {
                 this.chatItems.push({
@@ -3537,16 +3579,59 @@ export default {
                 });
             }
         },
-        async getPeerPath() {
-            if (this.selectedPeer) {
-                try {
-                    const response = await getDestinationPath(window.api, this.selectedPeer.destination_hash, {});
-                    this.selectedPeerPath = response.data.path;
-                } catch (e) {
-                    console.log(e);
-                    this.selectedPeerPath = null;
+        applyPeerPathSnapshot(snapshot, hash) {
+            if (!this._hexEqual(this.selectedPeer?.destination_hash, hash)) {
+                return;
+            }
+            this.peerPathSnapshot = snapshot ?? normalizePathSnapshot(null);
+        },
+        async refreshPeerPath(options = {}) {
+            const hash = options.hash ?? this.selectedPeer?.destination_hash;
+            if (!hash) {
+                return null;
+            }
+
+            const warm = options.warm === true;
+            const seq = ++this.peerPathRequestSequence;
+            this.peerPathLoading = true;
+
+            try {
+                let snapshot = await fetchPeerPathSnapshot(window.api, hash);
+                if (seq !== this.peerPathRequestSequence) {
+                    return null;
+                }
+                this.applyPeerPathSnapshot(snapshot, hash);
+
+                if (warm) {
+                    const { requested } = await warmPathIfNeeded(window.api, hash, snapshot);
+                    if (requested) {
+                        if (seq !== this.peerPathRequestSequence) {
+                            return snapshot;
+                        }
+                        this.peerPathWarming = true;
+                        snapshot = await fetchPeerPathSnapshot(window.api, hash);
+                        if (seq === this.peerPathRequestSequence) {
+                            this.applyPeerPathSnapshot(snapshot, hash);
+                        }
+                    }
+                }
+
+                return snapshot;
+            } catch (e) {
+                console.log(e);
+                if (seq === this.peerPathRequestSequence) {
+                    this.applyPeerPathSnapshot(null, hash);
+                }
+                return null;
+            } finally {
+                if (seq === this.peerPathRequestSequence) {
+                    this.peerPathLoading = false;
+                    this.peerPathWarming = false;
                 }
             }
+        },
+        async getPeerPath() {
+            await this.refreshPeerPath({ warm: false });
         },
         async getPeerLxmfStampInfo() {
             if (this.selectedPeer) {
@@ -3585,7 +3670,15 @@ export default {
             }
         },
         onDestinationPathClick(path) {
-            DialogUtils.alert(`${path.hops} ${path.hops === 1 ? "hop" : "hops"} away via ${path.next_hop_interface}`);
+            const snapshot = this.peerPathSnapshot;
+            const parts = [`${path.hops} ${path.hops === 1 ? "hop" : "hops"} away via ${path.next_hop_interface}`];
+            if (snapshot?.path_stale) {
+                parts.push(this.$t("messages.path_stale_hint"));
+            }
+            if (snapshot?.path_unresponsive) {
+                parts.push(this.$t("messages.path_unresponsive_hint"));
+            }
+            DialogUtils.alert(parts.join("\n\n"));
         },
         onStampInfoClick(stampInfo) {
             const stampCost = stampInfo.stamp_cost;
@@ -3857,6 +3950,16 @@ export default {
                 chatItem.is_actions_expanded = true;
             } else {
                 chatItem.is_actions_expanded = false;
+            }
+        },
+        onOutboundImageClick(chatItem) {
+            if (this.canCancelOutboundSend(chatItem)) {
+                this.onChatItemClick(chatItem);
+                return;
+            }
+            const src = this.pendingOutboundImageSrc(chatItem);
+            if (src) {
+                this.openImage(src);
             }
         },
         copyableMessagePlainText(chatItem) {
@@ -4280,29 +4383,146 @@ export default {
             }
             return this.lxmfImageUrl(h);
         },
+        _isPendingOutboundHash(hash) {
+            return typeof hash === "string" && hash.startsWith("pending-");
+        },
+        _outboundPendingMatchKey(lxmfMessage) {
+            if (!lxmfMessage) {
+                return null;
+            }
+            const dest = (lxmfMessage.destination_hash || "").toLowerCase();
+            const content = (lxmfMessage.content || "").trim();
+            const reply = (lxmfMessage.reply_to_hash || "").toLowerCase();
+            const image = lxmfMessage.fields?.image;
+            let media = "";
+            if (image && typeof image === "object") {
+                media = `img:${image.image_type || ""}:${image.image_size || 0}`;
+            }
+            return `${dest}|${reply}|${content}|${media}`;
+        },
+        _outboundPendingAlreadySatisfied(pendingMessage) {
+            const pendingKey = this._outboundPendingMatchKey(pendingMessage);
+            if (!pendingKey) {
+                return false;
+            }
+            return this.chatItems.some((item) => {
+                if (!item.is_outbound) {
+                    return false;
+                }
+                const hash = item.lxmf_message?.hash;
+                if (this._isPendingOutboundHash(hash)) {
+                    return false;
+                }
+                return this._outboundPendingMatchKey(item.lxmf_message) === pendingKey;
+            });
+        },
+        _hideRedundantOutboundPendingItems(items) {
+            const realKeys = new Set();
+            for (const item of items) {
+                if (!item.is_outbound) {
+                    continue;
+                }
+                const hash = item.lxmf_message?.hash;
+                if (this._isPendingOutboundHash(hash)) {
+                    continue;
+                }
+                const key = this._outboundPendingMatchKey(item.lxmf_message);
+                if (key) {
+                    realKeys.add(key);
+                }
+            }
+            return items.filter((item) => {
+                if (!item.is_outbound) {
+                    return true;
+                }
+                const hash = item.lxmf_message?.hash;
+                if (!this._isPendingOutboundHash(hash)) {
+                    return true;
+                }
+                const key = this._outboundPendingMatchKey(item.lxmf_message);
+                return !key || !realKeys.has(key);
+            });
+        },
+        reconcileOutboundPendingPlaceholders(knownRealMessage) {
+            const realKeys = new Set();
+            if (knownRealMessage) {
+                const key = this._outboundPendingMatchKey(knownRealMessage);
+                if (key) {
+                    realKeys.add(key);
+                }
+            }
+            for (const item of this.chatItems) {
+                if (!item.is_outbound) {
+                    continue;
+                }
+                const hash = item.lxmf_message?.hash;
+                if (this._isPendingOutboundHash(hash)) {
+                    continue;
+                }
+                const key = this._outboundPendingMatchKey(item.lxmf_message);
+                if (key) {
+                    realKeys.add(key);
+                }
+            }
+            if (realKeys.size === 0) {
+                return;
+            }
+            this.chatItems = this.chatItems.filter((item) => {
+                if (!item.is_outbound) {
+                    return true;
+                }
+                const hash = item.lxmf_message?.hash;
+                if (!this._isPendingOutboundHash(hash)) {
+                    return true;
+                }
+                const key = this._outboundPendingMatchKey(item.lxmf_message);
+                return !key || !realKeys.has(key);
+            });
+        },
         removePendingOutboundPlaceholder(hash) {
             if (!hash) {
                 return;
             }
-            this.chatItems = this.chatItems.filter((item) => item.lxmf_message?.hash !== hash);
+            this.chatItems = this.chatItems.filter((item) => !this._hexEqual(item.lxmf_message?.hash, hash));
         },
-        removeFirstPendingOutboundPlaceholderForPeer(destinationHash) {
-            let removed = false;
+        removeAllPendingOutboundPlaceholdersForPeer(destinationHash) {
+            if (!destinationHash) {
+                return;
+            }
             this.chatItems = this.chatItems.filter((item) => {
-                if (removed) {
-                    return true;
-                }
                 const h = item.lxmf_message?.hash;
                 if (
                     item.is_outbound &&
-                    h?.startsWith("pending-") &&
-                    item.lxmf_message.destination_hash === destinationHash
+                    this._isPendingOutboundHash(h) &&
+                    this._hexEqual(item.lxmf_message?.destination_hash, destinationHash)
                 ) {
-                    removed = true;
                     return false;
                 }
                 return true;
             });
+        },
+        removeFirstPendingOutboundPlaceholderForPeer(destinationHash) {
+            this.removeAllPendingOutboundPlaceholdersForPeer(destinationHash);
+        },
+        _absorbOutboundSendResponse(job, lxmfMessage) {
+            this.removePendingOutboundPlaceholder(job?.pendingHash);
+            if (job?.destinationHash) {
+                this.removeAllPendingOutboundPlaceholdersForPeer(job.destinationHash);
+            }
+            this.reconcileOutboundPendingPlaceholders(lxmfMessage);
+            if (lxmfMessage?.hash && !this.isLxmfMessageInUi(lxmfMessage.hash)) {
+                this.chatItems.push({
+                    type: "lxmf_message",
+                    lxmf_message: this.normalizeLxmfMessage(lxmfMessage, true),
+                    is_outbound: true,
+                });
+            }
+        },
+        showOutboundTransferProgress(lxmfMessage) {
+            if (!GlobalState.outboundTransferProgressEnabled) {
+                return false;
+            }
+            return this.outboundTransferProgressPercent(lxmfMessage) !== null;
         },
         outboundTransferProgressPercent(lxmfMessage) {
             if (!lxmfMessage || lxmfMessage._pendingPathfinding) {
@@ -4321,6 +4541,58 @@ export default {
         outboundSendingProgressLabel(lxmfMessage) {
             const pct = this.outboundTransferProgressPercent(lxmfMessage);
             return pct === null ? null : `${pct}%`;
+        },
+        outboundTransferElapsedSeconds(lxmfMessage, chatItem) {
+            void this.sendStatusUiMs;
+            const createdAt = chatItem?.created_at || lxmfMessage?.created_at;
+            if (!createdAt) {
+                return 0;
+            }
+            const createdMs = new Date(createdAt).getTime();
+            if (!createdMs) {
+                return 0;
+            }
+            return Math.max(0, Math.floor((this.sendStatusUiMs - createdMs) / 1000));
+        },
+        outboundTransferSpeedBytesPerSecond(lxmfMessage, chatItem) {
+            const progress = Number(lxmfMessage?.progress ?? 0);
+            const totalBytes = Utils.lxmfMessageTransferTotalBytes(lxmfMessage, (value) =>
+                this.base64ByteLength(value)
+            );
+            const elapsedSeconds = this.outboundTransferElapsedSeconds(lxmfMessage, chatItem);
+            if (totalBytes <= 0 || progress <= 0 || elapsedSeconds <= 0) {
+                return 0;
+            }
+            const transferredBytes = (progress / 100) * totalBytes;
+            return transferredBytes / elapsedSeconds;
+        },
+        outboundTransferHopsLabel(lxmfMessage) {
+            const hops = lxmfMessage?.path_hops_at_send;
+            if (hops == null) {
+                return null;
+            }
+            const count = Number(hops);
+            if (!Number.isFinite(count)) {
+                return null;
+            }
+            if (count === 1) {
+                return this.$t("messages.transfer_progress_hop_one");
+            }
+            return this.$t("messages.transfer_progress_hops", { count });
+        },
+        outboundTransferStatsLabel(lxmfMessage, chatItem) {
+            void GlobalState.outboundTransferProgressEnabled;
+            if (!this.showOutboundTransferProgress(lxmfMessage)) {
+                return null;
+            }
+            const bytesPerSecond = this.outboundTransferSpeedBytesPerSecond(lxmfMessage, chatItem);
+            const parts = [Utils.formatBytesPerSecond(bytesPerSecond)];
+            const hopsLabel = this.outboundTransferHopsLabel(lxmfMessage);
+            if (hopsLabel) {
+                parts.push(hopsLabel);
+            }
+            parts.push(Utils.formatCountupDuration(this.outboundTransferElapsedSeconds(lxmfMessage, chatItem)));
+            return parts.join(" · ");
         },
         outboundSendingStatusTooltip(lxmfMessage) {
             if (!lxmfMessage) {
@@ -4428,6 +4700,15 @@ export default {
                 return true;
             }
             return ["outbound", "sending", "generating"].includes(m.state);
+        },
+        canCancelOutboundSend(chatItem) {
+            if (!chatItem?.is_outbound || !chatItem.lxmf_message?.hash) {
+                return false;
+            }
+            if (this._isPendingOutboundHash(chatItem.lxmf_message.hash)) {
+                return true;
+            }
+            return this.isOutboundPendingForUi(chatItem);
         },
         isOutboundSendEscalated(chatItem) {
             const m = chatItem?.lxmf_message;
@@ -4656,13 +4937,78 @@ export default {
             return lxmfMessage.method === "opportunistic" && lxmfMessage.state === "failed";
         },
         async warmPathToPeer() {
-            if (!this.selectedPeer?.destination_hash) {
+            await this.refreshPeerPath({ warm: true });
+        },
+        async runPathFinderQuickRequest() {
+            const hash = this.selectedPeer?.destination_hash;
+            if (!hash || this.pathfinderInProgress) {
                 return;
             }
+            this.pathfinderInProgress = true;
             try {
-                await postRequestPath(window.api, this.selectedPeer.destination_hash);
+                let snapshot = this.peerPathSnapshot;
+                if (!snapshot) {
+                    snapshot = await fetchPeerPathSnapshot(window.api, hash);
+                    this.applyPeerPathSnapshot(snapshot, hash);
+                }
+                if (!pathNeedsRefresh(snapshot)) {
+                    ToastUtils.info(this.$t("messages.path_already_available"));
+                    return;
+                }
+                await runDestinationPathFinder(window.api, hash, "quick");
+                ToastUtils.success(this.$t("nomadnet.path_finder_request_sent"));
+                await this.refreshPeerPath({ warm: false });
             } catch (e) {
-                console.log(e);
+                console.error("path finder quick request failed", e);
+                ToastUtils.error(this.$t("nomadnet.path_finder_failed"));
+            } finally {
+                this.pathfinderInProgress = false;
+            }
+        },
+        async runPathFinderForceFind() {
+            const hash = this.selectedPeer?.destination_hash;
+            if (!hash || this.pathfinderInProgress) {
+                return;
+            }
+            this.pathfinderInProgress = true;
+            try {
+                const { path } = await runDestinationPathFinder(window.api, hash, "force", {
+                    forceTimeout: 15,
+                });
+                if (path) {
+                    ToastUtils.success(this.$t("nomadnet.path_finder_found"));
+                    this.applyPeerPathSnapshot(
+                        normalizePathSnapshot({ path, path_stale: false, path_unresponsive: false }),
+                        hash
+                    );
+                } else {
+                    ToastUtils.error(this.$t("nomadnet.path_finder_not_found"));
+                    await this.refreshPeerPath({ warm: false });
+                }
+            } catch (e) {
+                console.error("path finder force find failed", e);
+                ToastUtils.error(this.$t("nomadnet.path_finder_failed"));
+            } finally {
+                this.pathfinderInProgress = false;
+            }
+        },
+        async runPathFinderDropAndRequest() {
+            const hash = this.selectedPeer?.destination_hash;
+            if (!hash || this.pathfinderInProgress) {
+                return;
+            }
+            this.pathfinderInProgress = true;
+            try {
+                await runDestinationPathFinder(window.api, hash, "drop_then_request", {
+                    onDropPathError: (e) => console.warn("drop-path failed (continuing)", e),
+                });
+                ToastUtils.success(this.$t("nomadnet.path_finder_dropped_and_requested"));
+                await this.refreshPeerPath({ warm: false });
+            } catch (e) {
+                console.error("path finder drop+request failed", e);
+                ToastUtils.error(this.$t("nomadnet.path_finder_failed"));
+            } finally {
+                this.pathfinderInProgress = false;
             }
         },
         imageGroupGalleryUrls(items) {
@@ -4670,6 +5016,51 @@ export default {
         },
         downloadFileFromBase64: async function (fileName, fileBytesBase64) {
             DownloadUtils.downloadFromBase64(fileName, fileBytesBase64);
+        },
+        async downloadLxmfFileAttachment(chatItem, fileIndex) {
+            const msg = chatItem?.lxmf_message;
+            const attachments = msg?.fields?.file_attachments;
+            if (!msg?.hash || !Array.isArray(attachments) || fileIndex < 0 || fileIndex >= attachments.length) {
+                return;
+            }
+            const attachment = attachments[fileIndex];
+            const fileName = attachment.file_name || "download";
+            try {
+                const response = await window.api.get(`/api/v1/lxmf-messages/attachment/${msg.hash}/file`, {
+                    params: { file_index: fileIndex },
+                    responseType: "arraybuffer",
+                });
+                await DownloadUtils.downloadFromApiResponse(response, fileName);
+            } catch (e) {
+                console.error(e);
+                ToastUtils.error(this.$t("common.error"));
+            }
+        },
+        async downloadMessageImage(chatItem) {
+            this.messageContextMenu.show = false;
+            const msg = chatItem?.lxmf_message;
+            const img = msg?.fields?.image;
+            if (!msg?.hash || !img) {
+                return;
+            }
+            const rawType = String(img.image_type || "png")
+                .replace(/^image\//, "")
+                .toLowerCase();
+            const ext = rawType === "jpeg" ? "jpg" : rawType || "png";
+            const fileName = `image-${msg.hash.slice(0, 8)}.${ext}`;
+            try {
+                if (img.image_bytes) {
+                    DownloadUtils.downloadFromBase64(fileName, img.image_bytes);
+                    return;
+                }
+                const response = await window.api.get(`/api/v1/lxmf-messages/attachment/${msg.hash}/image`, {
+                    responseType: "arraybuffer",
+                });
+                await DownloadUtils.downloadFromApiResponse(response, fileName);
+            } catch (e) {
+                console.error(e);
+                ToastUtils.error(this.$t("common.error"));
+            }
         },
         async processAudioForSelectedPeerChatItems() {
             for (const chatItem of this.selectedPeerChatItems) {
@@ -4782,11 +5173,14 @@ export default {
                 }
 
                 // delete lxmf message from server
-                await window.api.delete(`/api/v1/lxmf-messages/${chatItem.lxmf_message.hash}`);
+                const hash = chatItem.lxmf_message.hash;
+                if (!this._isPendingOutboundHash(hash)) {
+                    await window.api.delete(`/api/v1/lxmf-messages/${hash}`);
+                }
 
                 // remove lxmf message from chat items using hash, as other pending items might not have an id yet
                 this.chatItems = this.chatItems.filter((item) => {
-                    return item.lxmf_message?.hash !== chatItem.lxmf_message.hash;
+                    return !this._hexEqual(item.lxmf_message?.hash, hash);
                 });
             } catch {
                 // do nothing if failed to delete message
@@ -4956,6 +5350,12 @@ export default {
                 replyQuotedContent,
                 myLxmfAddressHash: this.myLxmfAddressHash,
                 canOptimisticPending,
+                cancelKey: this._outboundPendingMatchKey({
+                    destination_hash: destinationHash,
+                    content: text,
+                    reply_to_hash: replyToHash,
+                    fields,
+                }),
             };
         },
         async sendMessage() {
@@ -4990,6 +5390,9 @@ export default {
         },
         async _executeOutboundSendJob(job) {
             try {
+                if (job.cancelled) {
+                    return;
+                }
                 job.pendingHash = null;
                 if (job.canOptimisticPending) {
                     const pendingHash = `pending-${uuidv4()}`;
@@ -5004,25 +5407,34 @@ export default {
                             _preview_url: previewUrl,
                         };
                     }
-                    this.chatItems.push({
-                        type: "lxmf_message",
-                        lxmf_message: {
-                            hash: pendingHash,
-                            content: job.text,
-                            state: "sending",
-                            progress: 0,
-                            created_at: new Date().toISOString(),
-                            destination_hash: job.destinationHash,
-                            source_hash: job.myLxmfAddressHash,
-                            fields: Object.keys(pendingFields).length > 0 ? pendingFields : undefined,
-                            reply_to_hash: job.replyToHash,
-                            _pendingPathfinding: true,
-                        },
-                        is_outbound: true,
-                    });
+                    const needsPathfinding = pathNeedsRefresh(this.peerPathSnapshot);
+                    const pendingMessage = {
+                        hash: pendingHash,
+                        content: job.text,
+                        state: "sending",
+                        progress: 0,
+                        created_at: new Date().toISOString(),
+                        destination_hash: job.destinationHash,
+                        source_hash: job.myLxmfAddressHash,
+                        fields: Object.keys(pendingFields).length > 0 ? pendingFields : undefined,
+                        reply_to_hash: job.replyToHash,
+                        _pendingPathfinding: needsPathfinding,
+                    };
+                    if (!this._outboundPendingAlreadySatisfied(pendingMessage)) {
+                        this.chatItems.push({
+                            type: "lxmf_message",
+                            lxmf_message: pendingMessage,
+                            is_outbound: true,
+                        });
+                    }
                     this.$nextTick(() => {
                         this.scrollMessagesToBottom();
                     });
+                }
+
+                if (job.cancelled) {
+                    this.removePendingOutboundPlaceholder(job.pendingHash);
+                    return;
                 }
 
                 if (job.images.length === 0) {
@@ -5037,15 +5449,13 @@ export default {
                         },
                     });
 
-                    this.removePendingOutboundPlaceholder(job.pendingHash);
-
-                    if (!this.isLxmfMessageInUi(response.data.lxmf_message.hash)) {
-                        this.chatItems.push({
-                            type: "lxmf_message",
-                            lxmf_message: this.normalizeLxmfMessage(response.data.lxmf_message, true),
-                            is_outbound: true,
-                        });
+                    if (job.cancelled) {
+                        await this._cancelOutboundByHash(response.data.lxmf_message.hash);
+                        this.removePendingOutboundPlaceholder(job.pendingHash);
+                        return;
                     }
+                    job.messageHash = response.data.lxmf_message.hash;
+                    this._absorbOutboundSendResponse(job, response.data.lxmf_message);
                 } else {
                     const firstImage = job.images[0];
                     const firstFields = {
@@ -5064,15 +5474,13 @@ export default {
                         },
                     });
 
-                    this.removePendingOutboundPlaceholder(job.pendingHash);
-
-                    if (!this.isLxmfMessageInUi(response.data.lxmf_message.hash)) {
-                        this.chatItems.push({
-                            type: "lxmf_message",
-                            lxmf_message: this.normalizeLxmfMessage(response.data.lxmf_message, true),
-                            is_outbound: true,
-                        });
+                    if (job.cancelled) {
+                        await this._cancelOutboundByHash(response.data.lxmf_message.hash);
+                        this.removePendingOutboundPlaceholder(job.pendingHash);
+                        return;
                     }
+                    job.messageHash = response.data.lxmf_message.hash;
+                    this._absorbOutboundSendResponse(job, response.data.lxmf_message);
 
                     for (let i = 1; i < job.images.length; i++) {
                         const image = job.images[i];
@@ -5104,34 +5512,62 @@ export default {
                 }
 
                 this.scrollMessagesToBottom();
+                this.refreshPeerPath({ warm: false });
             } catch (e) {
                 this.removePendingOutboundPlaceholder(job.pendingHash);
+                this.removeAllPendingOutboundPlaceholdersForPeer(job.destinationHash);
                 const message = e.response?.data?.message ?? "failed to send message";
                 DialogUtils.alert(message);
                 console.log(e);
             }
         },
+        async _cancelOutboundByHash(messageHash) {
+            if (!messageHash || this._isPendingOutboundHash(messageHash)) {
+                return;
+            }
+            try {
+                const response = await window.api.post(`/api/v1/lxmf-messages/${messageHash}/cancel`);
+                const lxmfMessage = response.data.lxmf_message;
+                if (lxmfMessage) {
+                    this.onLxmfMessageUpdated(lxmfMessage);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        },
         async cancelSendingMessage(chatItem) {
-            // get lxmf message hash else do nothing
-            const lxmfMessageHash = chatItem.lxmf_message.hash;
+            const lxmfMessage = chatItem?.lxmf_message;
+            const lxmfMessageHash = lxmfMessage?.hash;
             if (!lxmfMessageHash) {
                 return;
             }
 
+            chatItem.is_actions_expanded = false;
+            this.messageContextMenu.show = false;
+
+            const cancelMatch = {
+                pendingHash: this._isPendingOutboundHash(lxmfMessageHash) ? lxmfMessageHash : null,
+                messageHash: !this._isPendingOutboundHash(lxmfMessageHash) ? lxmfMessageHash : null,
+                cancelKey: this._outboundPendingMatchKey(lxmfMessage),
+            };
+            this._outboundQueue.cancelJob(cancelMatch);
+
+            if (this._isPendingOutboundHash(lxmfMessageHash)) {
+                this.removePendingOutboundPlaceholder(lxmfMessageHash);
+                return;
+            }
+
+            if (!this.canCancelOutboundSend(chatItem)) {
+                return;
+            }
+
             try {
-                // cancel sending lxmf message
                 const response = await window.api.post(`/api/v1/lxmf-messages/${lxmfMessageHash}/cancel`);
-
-                // get lxmf message from response
-                const lxmfMessage = response.data.lxmf_message;
-                if (!lxmfMessage) {
-                    return;
+                const updated = response.data.lxmf_message;
+                if (updated) {
+                    this.onLxmfMessageUpdated(updated);
                 }
-
-                // update lxmf message in ui
-                this.onLxmfMessageUpdated(lxmfMessage);
             } catch (e) {
-                // show error
                 const message = e.response?.data?.message ?? "failed to cancel message";
                 DialogUtils.alert(message);
                 console.log(e);
@@ -5451,6 +5887,15 @@ export default {
         },
         hasRenderableContent(msg) {
             return messageHasRenderableContent(msg);
+        },
+        hasFileAttachments(msg) {
+            return messageHasFileAttachments(msg);
+        },
+        hasMessageBubble(chatItem) {
+            return computeHasMessageBubble(chatItem, (item) => this.shouldHideAutoImageCaption(item));
+        },
+        isFileOnlyMessage(chatItem) {
+            return computeIsFileOnlyMessage(chatItem, (item) => this.shouldHideAutoImageCaption(item));
         },
         isImageOnlyMessage(chatItem) {
             return computeIsImageOnlyMessage(chatItem, (item) => this.shouldHideAutoImageCaption(item));

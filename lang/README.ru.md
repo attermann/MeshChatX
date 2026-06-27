@@ -12,6 +12,7 @@
 - Релизы: [github.com/Quad4-Software/MeshChatX](https://github.com/Quad4-Software/MeshChatX)
 - Журнал изменений: [`CHANGELOG.md`](../CHANGELOG.md)
 - Поддержка проекта: [`donate.md`](../donate.md) ([Поддержка проекта](#поддержка-проекта))
+- LXMF: `f489752fbef161c64d65e385a4e9fc74`
 - Umbrel App Store: [apps.umbrel.com/app/meshchatx](https://apps.umbrel.com/app/meshchatx)
 
 <a href="https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/https://github.com/Quad4-Software/MeshChatX"><img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" height="60" alt="Get it on Obtainium"></a>
@@ -345,7 +346,7 @@ task build:all
 
 ## Версионирование
 
-Текущая версия в репозитории: `4.7.0`.
+Текущая версия в репозитории: `4.7.1`.
 
 - Редактируйте для релизного бампа **только** поле `version` в **`package.json`**.
 - Команда **`pnpm run version:sync`** (также в начале **`pnpm run build`**) распространяет эту версию в **`pyproject.toml`**, **`meshchatx/src/version.py`**, **`THIRD_PARTY_NOTICES.txt`** (строка продукта), **README** / **lang/README.\*** (строки «текущая версия»), **`docs/meshchatx_on_raspberry_pi.md`** (пример pipx) и вспомогательные поля **`packaging/arch/PKGBUILD`**.

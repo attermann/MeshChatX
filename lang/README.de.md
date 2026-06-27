@@ -12,6 +12,7 @@ Dieses Projekt ist unabhaengig vom originalen Reticulum MeshChat und steht in ke
 - Releases: [github.com/Quad4-Software/MeshChatX](https://github.com/Quad4-Software/MeshChatX)
 - Aenderungsprotokoll: [`CHANGELOG.md`](../CHANGELOG.md)
 - Spenden: [`donate.md`](../donate.md) ([Spenden](#spenden))
+- LXMF: `f489752fbef161c64d65e385a4e9fc74`
 - Umbrel App Store: [apps.umbrel.com/app/meshchatx](https://apps.umbrel.com/app/meshchatx)
 
 <a href="https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/https://github.com/Quad4-Software/MeshChatX"><img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" height="60" alt="Get it on Obtainium"></a>
@@ -345,7 +346,7 @@ task build:all
 
 ## Versionierung
 
-Aktuelle Version in diesem Repository: `4.7.0`.
+Aktuelle Version in diesem Repository: `4.7.1`.
 
 - Fuer Release-Bumps bearbeiten Sie **nur** `version` in **`package.json`**.
 - **`pnpm run version:sync`** (wird auch zu Beginn von **`pnpm run build`** ausgefuehrt) verbreitet diese Version in **`pyproject.toml`**, **`meshchatx/src/version.py`**, **`THIRD_PARTY_NOTICES.txt`** (Produktzeile), **README** / **lang/README.\*** (Zeilen mit aktueller Version), **`docs/meshchatx_on_raspberry_pi.md`** (pipx-Beispiel) und Hilfsfelder in **`packaging/arch/PKGBUILD`**.

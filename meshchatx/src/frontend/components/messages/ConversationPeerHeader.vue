@@ -46,7 +46,7 @@
 
                 <div
                     v-if="
-                        selectedPeerPath ||
+                        showPeerPathRow ||
                         selectedPeerSignalMetrics?.snr != null ||
                         selectedPeerLxmfStampInfo?.stamp_cost ||
                         lxmfHasOutboundTicket
@@ -57,15 +57,18 @@
 
                     <div class="flex items-center gap-2 truncate">
                         <span
-                            v-if="selectedPeerPath"
-                            class="flex items-center cursor-pointer hover:text-gray-700 dark:hover:text-zinc-200 shrink-0"
-                            title="Path information"
-                            @click="$emit('destination-path-click', selectedPeerPath)"
+                            v-if="showPeerPathRow"
+                            class="flex items-center gap-1 shrink-0"
+                            :class="peerPathRowClass"
+                            :title="peerPathRowTitle"
+                            @click="onPeerPathRowClick"
                         >
-                            <span v-if="selectedPeerPath.hops === 0 || selectedPeerPath.hops === 1">{{
-                                $t("messages.direct")
-                            }}</span>
-                            <span v-else>{{ $t("messages.hops_away", { count: selectedPeerPath.hops }) }}</span>
+                            <MaterialDesignIcon
+                                v-if="peerPathBusy"
+                                icon-name="loading"
+                                class="size-3.5 animate-spin shrink-0"
+                            />
+                            <span>{{ peerPathRowLabel }}</span>
                         </span>
 
                         <span v-if="selectedPeerSignalMetrics?.snr != null" class="flex items-center gap-2 shrink-0">
@@ -114,6 +117,35 @@
         </div>
 
         <div class="ml-auto flex items-center gap-0.5 sm:gap-1.5 min-w-0 shrink-0">
+            <DropDownMenu class="shrink-0">
+                <template #button>
+                    <IconButton
+                        :title="$t('nomadnet.path_finder')"
+                        :disabled="pathfinderInProgress"
+                        class="text-blue-600 dark:text-blue-400"
+                    >
+                        <MaterialDesignIcon
+                            :icon-name="pathfinderInProgress ? 'loading' : 'map-marker-path'"
+                            :class="['size-6 sm:size-7', pathfinderInProgress ? 'animate-spin' : '']"
+                        />
+                    </IconButton>
+                </template>
+                <template #items>
+                    <DropDownMenuItem @click="$emit('path-finder-quick')">
+                        <MaterialDesignIcon icon-name="flash" class="size-5" />
+                        <span>{{ $t("nomadnet.path_finder_quick_request") }}</span>
+                    </DropDownMenuItem>
+                    <DropDownMenuItem @click="$emit('path-finder-force')">
+                        <MaterialDesignIcon icon-name="map-marker-radius" class="size-5" />
+                        <span>{{ $t("nomadnet.path_finder_force_find") }}</span>
+                    </DropDownMenuItem>
+                    <DropDownMenuItem @click="$emit('path-finder-drop')">
+                        <MaterialDesignIcon icon-name="reload-alert" class="size-5" />
+                        <span>{{ $t("nomadnet.path_finder_drop_and_request") }}</span>
+                    </DropDownMenuItem>
+                </template>
+            </DropDownMenu>
+
             <ConversationDropDownMenu
                 v-if="selectedPeer"
                 :peer="selectedPeer"
@@ -143,6 +175,8 @@ import MaterialDesignIcon from "../MaterialDesignIcon.vue";
 import IconButton from "../IconButton.vue";
 import LxmfUserIcon from "../LxmfUserIcon.vue";
 import ConversationDropDownMenu from "./ConversationDropDownMenu.vue";
+import DropDownMenu from "../DropDownMenu.vue";
+import DropDownMenuItem from "../DropDownMenuItem.vue";
 
 dayjs.extend(relativeTime);
 
@@ -153,6 +187,8 @@ export default {
         IconButton,
         LxmfUserIcon,
         ConversationDropDownMenu,
+        DropDownMenu,
+        DropDownMenuItem,
     },
     props: {
         selectedPeer: {
@@ -175,6 +211,18 @@ export default {
             type: Object,
             default: null,
         },
+        peerPathSnapshot: {
+            type: Object,
+            default: null,
+        },
+        peerPathLoading: {
+            type: Boolean,
+            default: false,
+        },
+        peerPathWarming: {
+            type: Boolean,
+            default: false,
+        },
         selectedPeerSignalMetrics: {
             type: Object,
             default: null,
@@ -182,6 +230,10 @@ export default {
         selectedPeerLxmfStampInfo: {
             type: Object,
             default: null,
+        },
+        pathfinderInProgress: {
+            type: Boolean,
+            default: false,
         },
     },
     emits: [
@@ -197,10 +249,67 @@ export default {
         "start-call",
         "share-contact",
         "close",
+        "path-finder-quick",
+        "path-finder-force",
+        "path-finder-drop",
     ],
     computed: {
         destinationDisplay() {
             return Utils.formatDestinationHash(this.selectedPeer?.destination_hash);
+        },
+        peerPathBusy() {
+            return this.pathfinderInProgress || this.peerPathWarming;
+        },
+        showPeerPathRow() {
+            return (
+                this.peerPathBusy ||
+                this.peerPathLoading ||
+                this.selectedPeerPath != null ||
+                (this.peerPathSnapshot != null && !this.selectedPeerPath)
+            );
+        },
+        peerPathRowLabel() {
+            if (this.peerPathBusy) {
+                return this.$t("messages.outbound_pathfinding_short");
+            }
+            if (this.peerPathLoading && !this.selectedPeerPath) {
+                return this.$t("messages.path_loading");
+            }
+            if (this.selectedPeerPath) {
+                let label =
+                    this.selectedPeerPath.hops === 0 || this.selectedPeerPath.hops === 1
+                        ? this.$t("messages.direct")
+                        : this.$t("messages.hops_away", { count: this.selectedPeerPath.hops });
+                if (this.peerPathSnapshot?.path_stale) {
+                    label += ` (${this.$t("messages.path_stale_label")})`;
+                } else if (this.peerPathSnapshot?.path_unresponsive) {
+                    label += ` (${this.$t("messages.path_unresponsive_label")})`;
+                }
+                return label;
+            }
+            return this.$t("messages.path_no_route");
+        },
+        peerPathRowClass() {
+            const base = "cursor-pointer hover:text-gray-700 dark:hover:text-zinc-200";
+            if (this.peerPathBusy) {
+                return `${base} text-blue-600 dark:text-blue-400`;
+            }
+            if (!this.selectedPeerPath) {
+                return `${base} text-amber-700 dark:text-amber-400`;
+            }
+            if (this.peerPathSnapshot?.path_stale || this.peerPathSnapshot?.path_unresponsive) {
+                return `${base} text-amber-700 dark:text-amber-400`;
+            }
+            return base;
+        },
+        peerPathRowTitle() {
+            if (this.peerPathBusy) {
+                return this.$t("messages.outbound_pathfinding_tooltip");
+            }
+            if (!this.selectedPeerPath) {
+                return this.$t("messages.path_no_route_hint");
+            }
+            return this.$t("messages.path_info_title");
         },
         lxmfHasOutboundTicket() {
             return this.selectedPeerLxmfStampInfo?.outbound_ticket_expiry != null;
@@ -229,6 +338,13 @@ export default {
                 return "";
             }
             return dayjs(ms).fromNow();
+        },
+    },
+    methods: {
+        onPeerPathRowClick() {
+            if (this.selectedPeerPath) {
+                this.$emit("destination-path-click", this.selectedPeerPath);
+            }
         },
     },
 };

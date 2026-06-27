@@ -1040,6 +1040,7 @@ import Utils from "../../js/Utils";
 import ElectronUtils from "../../js/ElectronUtils";
 import DialogUtils from "../../js/DialogUtils";
 import ToastUtils from "../../js/ToastUtils";
+import DownloadUtils from "../../js/DownloadUtils";
 import GlobalEmitter from "../../js/GlobalEmitter";
 export default {
     name: "AboutPage",
@@ -1085,7 +1086,7 @@ export default {
             chromeVersion: null,
             nodeVersion: null,
             showContactSupport: false,
-            developerLxmfPrimary: "7cc8d66b4f6a0e0e49d34af7f6077b5a",
+            developerLxmfPrimary: "f489752fbef161c64d65e385a4e9fc74",
             developerLxmfAlternate: "43d3309adf27fc446556121b553b56a6",
             moneroDonateAddress:
                 "83SUg6mmkkVGwCycckLEgRfdmXNm7H9XtVjbGXp5kko71N6pTefYURJeS7WdEGHrz2aagmt4nF3dWg6mHcYs6yu4EokwhTh",
@@ -1201,17 +1202,11 @@ export default {
         },
         async downloadSnapshot(filename) {
             try {
+                const downloadName = filename.endsWith(".zip") ? filename : `${filename}.zip`;
                 const response = await window.api.get(`/api/v1/database/snapshots/${filename}/download`, {
-                    responseType: "blob",
+                    responseType: "arraybuffer",
                 });
-                const url = window.URL.createObjectURL(new Blob([response.data]));
-                const link = document.createElement("a");
-                link.href = url;
-                link.setAttribute("download", filename);
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                window.URL.revokeObjectURL(url);
+                await DownloadUtils.downloadFromApiResponse(response, downloadName);
                 ToastUtils.success(this.$t("about.snapshot_downloaded"));
             } catch {
                 ToastUtils.error(this.$t("about.snapshot_download_failed"));
@@ -1220,16 +1215,9 @@ export default {
         async downloadBackupFile(filename) {
             try {
                 const response = await window.api.get(`/api/v1/database/backups/${filename}/download`, {
-                    responseType: "blob",
+                    responseType: "arraybuffer",
                 });
-                const url = window.URL.createObjectURL(new Blob([response.data]));
-                const link = document.createElement("a");
-                link.href = url;
-                link.setAttribute("download", filename);
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                window.URL.revokeObjectURL(url);
+                await DownloadUtils.downloadFromApiResponse(response, filename);
                 ToastUtils.success(this.$t("about.backup_downloaded"));
             } catch {
                 ToastUtils.error(this.$t("about.backup_download_failed"));
@@ -1391,20 +1379,12 @@ export default {
             this.backupError = "";
             try {
                 const response = await window.api.get("/api/v1/database/backup/download", {
-                    responseType: "blob",
+                    responseType: "arraybuffer",
                 });
-                const blob = new Blob([response.data], { type: "application/zip" });
-                const url = window.URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                link.href = url;
                 const filename =
                     response.headers["content-disposition"]?.split("filename=")?.[1]?.replace(/"/g, "") ||
                     "meshchatx-backup.zip";
-                link.setAttribute("download", filename);
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                window.URL.revokeObjectURL(url);
+                await DownloadUtils.downloadFromApiResponse(response, filename);
                 this.backupMessage = "Backup downloaded";
                 await this.getDatabaseHealth();
             } catch (e) {

@@ -2,7 +2,7 @@
 #    uv export --no-dev --no-emit-project --no-hashes -o requirements.txt
 aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.14.0
+aiohttp==3.14.1
     # via
     #   aiohttp-session
     #   reticulum-meshchatx
@@ -29,7 +29,7 @@ cffi==2.0.0
     #   cryptography
     #   lxst
     #   miniaudio
-cryptography==46.0.7
+cryptography==49.0.0
     # via
     #   reticulum-meshchatx
     #   rns
@@ -49,7 +49,7 @@ lxmf==1.0.1
     # via
     #   lxst
     #   reticulum-meshchatx
-lxst==0.4.6
+lxst==0.4.7
     # via reticulum-meshchatx
 miniaudio==1.71
     # via reticulum-meshchatx

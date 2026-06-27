@@ -17,7 +17,12 @@ const fs = require("fs");
 const path = require("node:path");
 
 const { createBackendProcessManager } = require("./backendProcess");
-const { getUserProvidedArguments, formatRenderProcessGoneDetails, isLocalBackendUrl } = require("./mainHelpers");
+const {
+    getUserProvidedArguments,
+    formatRenderProcessGoneDetails,
+    isLocalBackendUrl,
+    shouldOpenInElectronWindow,
+} = require("./mainHelpers");
 const { isAllowedShellPath } = require("./shellPathGuard");
 const { normalizeExternalUrlForOpen } = require("./safeExternalUrl");
 
@@ -181,6 +186,15 @@ ipcMain.handle("backend-runtime-state", () => {
     return getBackendManager().getRuntimeState();
 });
 
+ipcMain.handle("backend-startup-diagnostics", () => {
+    return getBackendManager().getStartupDiagnostics();
+});
+
+ipcMain.handle("mark-backend-healthy", () => {
+    getBackendManager().markBackendHealthy();
+    return { ok: true };
+});
+
 ipcMain.handle("restart-backend", async () => {
     return await getBackendManager().restartBackend(integrityStatus);
 });
@@ -321,6 +335,40 @@ ipcMain.handle("pick-directory", async () => {
     }
     return filePaths[0];
 });
+
+function getChildBrowserWindowOptions() {
+    return {
+        autoHideMenuBar: true,
+        webPreferences: {
+            preload: path.join(__dirname, "preload.js"),
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            enableRemoteModule: false,
+        },
+    };
+}
+
+function handleWindowOpenRequest(url) {
+    if (shouldOpenInElectronWindow(url)) {
+        return {
+            action: "allow",
+            overrideBrowserWindowOptions: getChildBrowserWindowOptions(),
+        };
+    }
+
+    const safe = normalizeExternalUrlForOpen(url);
+    if (safe) {
+        shell.openExternal(safe);
+    }
+    return {
+        action: "deny",
+    };
+}
+
+function attachWindowOpenHandler(browserWindow) {
+    browserWindow.webContents.setWindowOpenHandler(({ url }) => handleWindowOpenRequest(url));
+}
 
 function attachDevToolsF12Shortcut(browserWindow) {
     browserWindow.webContents.on("before-input-event", (event, input) => {
@@ -479,6 +527,7 @@ async function loadBackendCrashPage(crash) {
     const stdoutBase64 = Buffer.from((crash && crash.stdout) || "").toString("base64");
     const stderrBase64 = Buffer.from((crash && crash.stderr) || "").toString("base64");
     const code = crash && crash.code != null ? String(crash.code) : "";
+    const paths = getBackendManager().getStartupDiagnostics().paths;
 
     if (!mainWindow || mainWindow.isDestroyed()) {
         await dialog.showMessageBox({
@@ -497,6 +546,8 @@ async function loadBackendCrashPage(crash) {
             code: code,
             stdout: stdoutBase64,
             stderr: stderrBase64,
+            logPath: paths?.backendLogPath || "",
+            crashReportPath: paths?.crashReportPath || "",
         },
     });
 }
@@ -558,6 +609,7 @@ app.whenReady().then(async () => {
     app.on("browser-window-created", (event, browserWindow) => {
         attachDefaultContextMenu(browserWindow);
         attachDevToolsF12Shortcut(browserWindow);
+        attachWindowOpenHandler(browserWindow);
     });
 
     // Security: Enforce CSP for all requests as a shell-level fallback
@@ -658,52 +710,6 @@ app.whenReady().then(async () => {
             }
         });
 
-        // open external links in default web browser instead of electron
-        mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-            var shouldShowInNewElectronWindow = false;
-
-            // we want to open call.html in a new electron window
-            // but all other target="_blank" links should open in the system web browser
-            // we don't want /rnode-flasher/index.html to open in electron, otherwise user can't select usb devices...
-            if (
-                (url.startsWith("http://localhost") || url.startsWith("https://localhost")) &&
-                url.includes("/call.html")
-            ) {
-                shouldShowInNewElectronWindow = true;
-            }
-
-            // we want to open blob urls in a new electron window
-            else if (url.startsWith("blob:")) {
-                shouldShowInNewElectronWindow = true;
-            }
-
-            // open in new electron window
-            if (shouldShowInNewElectronWindow) {
-                return {
-                    action: "allow",
-                    overrideBrowserWindowOptions: {
-                        autoHideMenuBar: true,
-                        webPreferences: {
-                            preload: path.join(__dirname, "preload.js"),
-                            nodeIntegration: false,
-                            contextIsolation: true,
-                            sandbox: true,
-                            enableRemoteModule: false,
-                        },
-                    },
-                };
-            }
-
-            // fallback to opening any other url in external browser (http(s) / mailto only)
-            const safe = normalizeExternalUrlForOpen(url);
-            if (safe) {
-                shell.openExternal(safe);
-            }
-            return {
-                action: "deny",
-            };
-        });
-
         // navigate to loading page
         await mainWindow.loadFile(path.join(__dirname, "loading.html"));
 
@@ -745,7 +751,7 @@ app.whenReady().then(async () => {
         path.join(resourcesPath, "backend", exeName),
         // @electron/packager extraResource: copies build/exe/<platform>-<arch> to resources/<platform>-<arch>/
         packagedExtraResourceDir,
-        // electron-forge extraResource location (resources/exe)
+        // legacy electron-forge extraResource location (resources/exe)
         path.join(resourcesPath, "exe", exeName),
         // legacy packaged app - extraFiles location (resources/app/electron/build/exe)
         path.join(resourcesPath, "app", "electron", "build", "exe", exeName),

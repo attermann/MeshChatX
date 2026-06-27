@@ -12,10 +12,11 @@ from unittest.mock import MagicMock
 import pytest
 
 pytest.importorskip("LXST")
+pytestmark = pytest.mark.lxst_real
 
-from LXST.Primitives import Telephony as LXSTTelephony
+from LXST.Primitives import Telephony as LXSTTelephony  # noqa: E402
 
-from meshchatx.src.backend.telephone_manager import TelephoneManager
+from meshchatx.src.backend.telephone_manager import TelephoneManager  # noqa: E402
 
 
 class _DummyThread:
